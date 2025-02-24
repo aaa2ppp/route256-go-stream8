@@ -1,0 +1,183 @@
+#!/bin/sh
+
+user=123
+token="testtoken"
+
+cart="http://localhost:8082/cart"
+order="http://localhost:8083/order"
+stock="http://localhost:8083/stock"
+product="http://route256.pavl.uk:8080"
+
+configure_script() {
+    case "$(uname -s)" in
+        MINGW*|CYGWIN*|MSYS*)
+            # Windows (Git Bash, Cygwin, MSYS)
+            python_cmd=python
+            ;;
+        *)
+            # Другие системы (Linux, macOS, WSL)
+            python_cmd=python3
+            ;;
+    esac
+
+    # Проверка наличия Python
+    if ! command -v $python_cmd >/dev/null 2>&1; then
+        echo "Warning: $python_cmd is not installed, JSON formatting will be disabled." >&2
+        python_cmd=""
+    fi
+}
+
+post() {
+    local resp
+    resp=$(curl -i -sS -X POST "$1" -H "X-Authtoken: $token" -d "$2")
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
+
+    if [ -n "$python_cmd" ] && echo "$resp" | grep -q "Content-Type: application/json"; then
+        echo "$resp" | (write_headers; write_pretty_json)
+    else 
+        echo "$resp"
+    fi
+}
+
+write_headers() {
+    local cr=$(printf "\r")
+    while read -r line; do
+        echo "$line"
+        if [ -z "${line%$cr}" ]; then
+            return
+        fi
+    done
+}
+
+write_pretty_json() {
+    if [ -z "$python_cmd" ]; then
+        cat  # Просто выводим данные как есть
+    else
+        $python_cmd -m json.tool --no-ensure-ascii
+    fi
+}    
+
+main() {
+    configure_script
+
+    local cmd=$(basename "$0")
+    case $cmd in
+    cart|order|stock|product)
+        ;;
+    *)
+        cmd=$1
+        shift
+        ;;
+    esac
+
+    case $cmd in
+    cart)
+        cart "$@"
+        ;;
+    order)
+        order "$@"
+        ;;
+    stock)
+        stock "$@"
+        ;;
+    product)
+        product "$@"
+        ;;
+    *)
+        echo "Usage: $(basename "$0") {cart|order|stock|product} [options ...]" >&2
+        exit 1
+        ;;
+    esac
+}
+
+cart() {
+    local cmd=$1
+    shift
+    case $cmd in
+    add)
+        post "$cart/item/add" '{"user":'"$user"',"sku":'"$1"',"count":'"${2:-1}"'}'
+        ;;
+    delete)
+        post "$cart/item/delete" '{"user":'"$user"',"sku":'"$1"'}'
+        ;;
+    list)
+        post "$cart/list" '{"user":'"$user"'}'
+        ;;
+    clear)
+        post "$cart/clear" '{"user":'"$user"'}'
+        ;;
+    checkout)
+        post "$cart/checkout" '{"user":'"$user"'}'
+        ;;
+    *)
+        echo "Usage:" >&2
+        echo "  cart add <sku> [<count>]" >&2
+        echo "  cart delete <sku>" >&2
+        echo "  cart list" >&2
+        echo "  cart clear" >&2
+        echo "  cart checkout" >&2
+        exit 1
+        ;;
+    esac
+}
+
+order() {
+    local cmd=$1
+    shift
+    case $cmd in
+    info)
+        post "$order/info" '{"orderID":'"$1"'}'
+        ;;
+    pay)
+        post "$order/pay" '{"orderID":'"$1"'}'
+        ;;
+    cancel)
+        post "$order/cancel" '{"orderID":'"$1"'}'
+        ;;
+    *)
+        echo "Usage:" >&2
+        echo "  order info <orderID>" >&2
+        echo "  order pay <orderID>" >&2
+        echo "  order cancel <orderID>" >&2
+        exit 1
+        ;;
+    esac
+}
+
+stock() {
+    local cmd=$1
+    shift
+    case $cmd in
+    info)
+        post "$stock/info" '{"sku":'"$1"'}'
+        ;;
+    *)
+        echo "Usage:" >&2
+        echo "  stock info <sku>" >&2
+        exit 1
+        ;;
+    esac
+}
+
+product() {
+    local cmd=$1
+    shift
+    case $cmd in
+    list)
+        post "$product/list_skus" '{"token":"'"$token"'","startAfterSku":0,"count": 10}'
+        ;;
+    info)
+        post "$product/get_product" '{"token":"'"$token"'","sku":'"$1"'}'
+        ;;
+    *)
+        echo "Usage:" >&2
+        echo "  product list" >&2
+        echo "  product info <sku>" >&2
+        exit 1
+        ;;
+    esac
+}
+
+main "$@"

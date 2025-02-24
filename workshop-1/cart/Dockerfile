@@ -1,4 +1,4 @@
-FROM golang:1.21
+FROM scratch
 
 ADD ./bin/app /app
 

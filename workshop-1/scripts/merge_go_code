@@ -1,0 +1,14 @@
+#!/bin/sh
+
+# Usage: merge_go_code <dir1> [<dir2> ...] > all_go_code.out
+
+merge() {
+    for dir in "$@"; do
+        find $dir -type f -name "*.go" \
+            -exec echo "// === {} ===" ';' \
+            -exec cat '{}' ';' \
+            -exec echo ';'
+    done
+}
+
+merge "$@"

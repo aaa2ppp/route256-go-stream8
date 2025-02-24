@@ -2,14 +2,14 @@ CURDIR=$(shell pwd)
 BINDIR=${CURDIR}/bin
 GOVER=$(shell go version | perl -nle '/(go\d\S+)/; print $$1;')
 SMARTIMPORTS=${BINDIR}/smartimports_${GOVER}
-LINTVER=v1.51.1
+LINTVER=v1.64.4
 LINTBIN=${BINDIR}/lint_${GOVER}_${LINTVER}
 PACKAGE=route256/loms/cmd/app
 
 all: format build test lint
 
 build: bindir
-	go build -o ${BINDIR}/app ${PACKAGE}
+	"${SHELL}" -c "go build -o ${BINDIR}/app ${PACKAGE}"
 
 test:
 	go test ./...

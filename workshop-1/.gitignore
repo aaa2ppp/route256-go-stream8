@@ -1,1 +1,8 @@
 .idea
+cover.out
+cover.html
+mem.out
+mem.bin
+cpu.out
+cpu.bin
+all_go_code.out
