@@ -96,7 +96,7 @@ func TestOrder_CreateOrder(t *testing.T) {
 			ts := httptest.NewServer(tt.handler)
 			defer ts.Close()
 
-			cfg := &config.OrderClient{
+			cfg := &config.HTTPLOMSClient{
 				BaseURL:             ts.URL,
 				RequestTimeout:      requestTimeout,
 				CreateOrderEndpoint: "/order/create",
@@ -173,7 +173,7 @@ func TestOrder_GetStockInfo(t *testing.T) {
 			ts := httptest.NewServer(tt.handler)
 			defer ts.Close()
 
-			cfg := &config.OrderClient{
+			cfg := &config.HTTPLOMSClient{
 				BaseURL:              ts.URL,
 				RequestTimeout:       requestTimeout,
 				GetStockInfoEndpoint: "/stock/info",

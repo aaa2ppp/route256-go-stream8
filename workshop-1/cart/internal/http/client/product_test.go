@@ -95,7 +95,7 @@ func TestProduct_GetInfo(t *testing.T) {
 			ts := httptest.NewServer(tt.handler)
 			defer ts.Close()
 
-			cfg := &config.ProductClient{
+			cfg := &config.HTTPProductClient{
 				BaseURL:        ts.URL,
 				RequestTimeout: requestTimeout,
 				GetEndpoint:    "/product/info",

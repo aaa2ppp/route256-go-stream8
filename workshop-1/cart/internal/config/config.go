@@ -17,24 +17,29 @@ type HTTPServer struct {
 	ShutdownTimeout time.Duration
 }
 
-type ProductClient struct {
+type HTTPProductClient struct {
 	BaseURL        string
 	GetEndpoint    string
 	RequestTimeout time.Duration
 }
 
-type OrderClient struct {
+type HTTPLOMSClient struct {
 	BaseURL              string
 	CreateOrderEndpoint  string
 	GetStockInfoEndpoint string
 	RequestTimeout       time.Duration
 }
 
+type GRPCLOMSClient struct {
+	Addr string
+}
+
 type Config struct {
-	Logger        *Logger
-	HTTPServer    *HTTPServer
-	OrderClient   *OrderClient
-	ProductClient *ProductClient
+	Logger            *Logger
+	HTTPServer        *HTTPServer
+	HTTPLOMSClient    *HTTPLOMSClient
+	HTTPProductClient *HTTPProductClient
+	GRPCLOMSClient    *GRPCLOMSClient
 }
 
 func Load() (Config, error) {
@@ -49,16 +54,19 @@ func Load() (Config, error) {
 			WriteTimeout:    10 * time.Second,
 			ShutdownTimeout: 30 * time.Second,
 		},
-		OrderClient: &OrderClient{
+		HTTPLOMSClient: &HTTPLOMSClient{
 			BaseURL:              "http://loms:8080",
 			CreateOrderEndpoint:  "/order/create",
 			GetStockInfoEndpoint: "/stock/info",
 			RequestTimeout:       10 * time.Second,
 		},
-		ProductClient: &ProductClient{
+		HTTPProductClient: &HTTPProductClient{
 			BaseURL:        "http://route256.pavl.uk:8080",
 			GetEndpoint:    "/get_product",
 			RequestTimeout: 10 * time.Second,
+		},
+		GRPCLOMSClient: &GRPCLOMSClient{
+			Addr: "loms:50051",
 		},
 	}, nil
 }

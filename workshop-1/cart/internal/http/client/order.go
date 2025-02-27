@@ -10,10 +10,10 @@ import (
 
 type Order struct {
 	client
-	cfg *config.OrderClient
+	cfg *config.HTTPLOMSClient
 }
 
-func NewOrder(cfg *config.OrderClient) Order {
+func NewOrder(cfg *config.HTTPLOMSClient) Order {
 	return Order{
 		client: newClient(cfg.BaseURL, cfg.RequestTimeout),
 		cfg:    cfg,

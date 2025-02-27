@@ -7,13 +7,15 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"syscall"
+
 	"route256/cart/internal/config"
+	grpcClient "route256/cart/internal/grpc/client"
 	httpClient "route256/cart/internal/http/client"
 	"route256/cart/internal/http/handler"
 	"route256/cart/internal/memstor"
 	"route256/cart/internal/service"
 	"route256/cart/pkg/http/middleware"
-	"syscall"
 )
 
 func Run() int {
@@ -23,11 +25,16 @@ func Run() int {
 	}
 
 	setupDefaultLogger(cfg.Logger)
+	
+	lomsClient, err := grpcClient.NewOrder(cfg.GRPCLOMSClient)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	cartService := service.NewCart(
 		memstor.NewCart(),
-		httpClient.NewOrder(cfg.OrderClient),
-		httpClient.NewProduct(cfg.ProductClient),
+		lomsClient,
+		httpClient.NewProduct(cfg.HTTPProductClient),
 	)
 
 	mux := http.NewServeMux()

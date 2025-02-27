@@ -10,10 +10,10 @@ import (
 
 type Product struct {
 	client
-	cfg *config.ProductClient
+	cfg *config.HTTPProductClient
 }
 
-func NewProduct(cfg *config.ProductClient) Product {
+func NewProduct(cfg *config.HTTPProductClient) Product {
 	return Product{
 		client: newClient(cfg.BaseURL, cfg.RequestTimeout),
 		cfg:    cfg,

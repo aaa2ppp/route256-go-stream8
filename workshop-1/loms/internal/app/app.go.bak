@@ -1,0 +1,141 @@
+package app
+
+import (
+	"context"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+
+	"route256/cart/pkg/http/middleware"
+	"route256/loms/internal/config"
+	grpcHandler "route256/loms/internal/grpc/handler"
+	httpHandler "route256/loms/internal/http/handler"
+	"route256/loms/internal/memstor"
+	"route256/loms/internal/service"
+	"route256/loms/pkg/api/order/v1"
+	"route256/loms/pkg/api/stock/v1"
+
+	"google.golang.org/grpc"
+)
+
+func Run() int {
+
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Error("can't load config", "error", err)
+		return 1
+	}
+
+	setupDefaultLogger(cfg.Logger)
+
+	lomsService := service.NewLOMS(
+		memstor.NewOrder(),
+		memstor.NewRandomStock(productsForTest), // xxx: for tests only, defined in products.go
+	)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /ping", pong)
+	mux.Handle("POST /order/create", httpHandler.CreateOrder(lomsService.CreateOrder))
+	mux.Handle("POST /order/info", httpHandler.GetOrderInfo(lomsService.GetOrderInfo))
+	mux.Handle("POST /order/pay", httpHandler.PayOrder(lomsService.PayOrder))
+	mux.Handle("POST /order/cancel", httpHandler.CancelOrder(lomsService.CancelOrder))
+	mux.Handle("POST /stock/info", httpHandler.GetStockInfo(lomsService.GetStockInfo))
+
+	httpServer := &http.Server{
+		Addr:         cfg.HTTPServer.Addr,
+		Handler:      middleware.Logging(slog.Default(), mux),
+		ReadTimeout:  cfg.HTTPServer.ReadTimeout,
+		WriteTimeout: cfg.HTTPServer.WriteTimeout,
+	}
+
+	grpcServer := grpc.NewServer()
+	order.RegisterOrderServer(grpcServer, grpcHandler.NewOrder(lomsService))
+	stock.RegisterStockServer(grpcServer, grpcHandler.NewStock(lomsService))
+
+	httpServerFail := make(chan struct{})
+	go func() {
+		slog.Info("http server startup", "addr", httpServer.Addr)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("http server fail", "error", err)
+			close(httpServerFail)
+		}
+	}()
+
+	grcpServerFail := make(chan struct{})
+	go func() {
+		addr := cfg.GRPCServer.Addr
+		slog.Info("grcp server startup", "addr", addr)
+		lis, err := net.Listen("tcp", addr)
+		if err != nil {
+			slog.Error("grpc server fail", "error", err)
+			close(grcpServerFail)
+		}
+		if err := grpcServer.Serve(lis); err != nil {
+			slog.Error("grpc server fail", "error", err)
+			close(grcpServerFail)
+		}
+	}()
+
+	exitCode := 0
+	var httpServerStopped, grpcServerStopped bool
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	select {
+	case signal := <-c:
+		slog.Info("shutdown by singnal", "singnal", signal)
+	case <-httpServerFail:
+		exitCode = 1
+		httpServerStopped = true
+		slog.Info("shutdown...")
+	case <-grcpServerFail:
+		exitCode = 1
+		grpcServerStopped = true
+		slog.Info("shutdown...")
+	}
+
+	var wg sync.WaitGroup
+
+	if !httpServerStopped {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), cfg.HTTPServer.ShutdownTimeout)
+			defer cancel()
+			if err := httpServer.Shutdown(ctx); err != nil {
+				slog.Error("can't shutdown http server", "error", err)
+			}
+		}()
+	}
+
+	if !grpcServerStopped {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			grpcServer.GracefulStop()
+		}()
+	}
+
+	wg.Wait()
+	return exitCode
+}
+
+func setupDefaultLogger(cfg *config.Logger) {
+	var handler slog.Handler
+	if cfg.PlainText {
+		handler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.Level})
+	} else {
+		handler = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.Level})
+	}
+	slog.SetDefault(slog.New(handler).With("app", "loms"))
+}
+
+func pong(w http.ResponseWriter, h *http.Request) {
+	if _, err := w.Write([]byte("pong")); err != nil {
+		slog.Error("ping: can't write pong")
+	}
+}
