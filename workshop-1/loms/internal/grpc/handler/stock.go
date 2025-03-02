@@ -22,7 +22,7 @@ func NewStock(service StockService) *Stock {
 func (s Stock) GetInfo(ctx context.Context, req *stock.GetInfoRequest) (*stock.GetInfoResponse, error) {
 	count, err := s.service.GetStockInfo(ctx, model.SKU(req.Sku))
 	if err != nil {
-		return nil, err
+		return nil, mapError(ctx, err)
 	}
 	return &stock.GetInfoResponse{Count: count}, nil
 }

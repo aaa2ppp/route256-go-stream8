@@ -33,7 +33,7 @@ func (o *Order) CreateOrder(ctx context.Context, req model.OrderCreateRequest) (
 	}
 	cresp, err := o.order.Create(ctx, creq)
 	if err != nil {
-		return 0, err
+		return 0, mapError(ctx, err)
 	}
 	return model.OrderID(cresp.OrderID), nil
 }
@@ -42,7 +42,7 @@ func (o *Order) CreateOrder(ctx context.Context, req model.OrderCreateRequest) (
 func (o *Order) GetStockInfo(ctx context.Context, sku model.SKU) (count uint64, _ error) {
 	cresp, err := o.stock.GetInfo(ctx, &stock.GetInfoRequest{Sku: int32(sku)})
 	if err != nil {
-		return 0, err
+		return 0, mapError(ctx, err)
 	}
 	return cresp.Count, nil
 }

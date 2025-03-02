@@ -8,6 +8,10 @@ import (
 	"net/http"
 	"runtime/debug"
 	"sync/atomic"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type loggerContextKey struct{}
@@ -80,4 +84,23 @@ func (hk *writeHeaderHook) WriteHeader(statusCode int) {
 func (hk *writeHeaderHook) Write(b []byte) (int, error) {
 	hk.WriteHeader(http.StatusOK)
 	return hk.ResponseWriter.Write(b)
+}
+
+func GRPCLogging(log *slog.Logger) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (_ interface{}, err error) {
+		log := log.With("grpcReqID", rand.Uint64())
+		log.Debug("grpc request begin", "fromAddr", "???", "method", info.FullMethod, "req", req)
+
+		defer func() {
+			if p := recover(); p != nil {
+				log.Error("*** panic recovered ***", "panic", p, "stack", debug.Stack())
+				err = status.Error(codes.Internal, "internal error")
+			}
+		}()
+
+		resp, err := handler(ContextWithLogger(ctx, log), req)
+		log.Debug("grpc request end", "status", status.Code(err), "resp", resp)
+
+		return resp, err
+	}
 }

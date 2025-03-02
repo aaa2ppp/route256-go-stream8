@@ -36,7 +36,7 @@ func (o Order) Create(ctx context.Context, req *order.CreateRequest) (*order.Cre
 	}
 	mresp, err := o.service.CreateOrder(ctx, mreq)
 	if err != nil {
-		return nil, err
+		return nil, mapError(ctx, err)
 	}
 	return &order.CreateResponse{OrderID: int64(mresp.OrderID)}, nil
 }
@@ -44,7 +44,7 @@ func (o Order) Create(ctx context.Context, req *order.CreateRequest) (*order.Cre
 func (o Order) GetInfo(ctx context.Context, req *order.GetInfoRequest) (*order.GetInfoResponse, error) {
 	mresp, err := o.service.GetOrderInfo(ctx, model.OrderID(req.OrderID))
 	if err != nil {
-		return nil, err
+		return nil, mapError(ctx, err)
 	}
 
 	resp := &order.GetInfoResponse{
@@ -64,14 +64,14 @@ func (o Order) GetInfo(ctx context.Context, req *order.GetInfoRequest) (*order.G
 
 func (o Order) Pay(ctx context.Context, req *order.PayRequest) (*order.PayResponse, error) {
 	if err := o.service.PayOrder(ctx, model.OrderID(req.OrderID)); err != nil {
-		return nil, err
+		return nil, mapError(ctx, err)
 	}
 	return &order.PayResponse{}, nil
 }
 
 func (o Order) Cancel(ctx context.Context, req *order.CancelRequest) (*order.CancelResponse, error) {
 	if err := o.service.CancelOrder(ctx, model.OrderID(req.OrderID)); err != nil {
-		return nil, err
+		return nil, mapError(ctx, err)
 	}
 	return &order.CancelResponse{}, nil
 }

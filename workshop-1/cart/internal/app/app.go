@@ -25,7 +25,8 @@ func Run() int {
 	}
 
 	setupDefaultLogger(cfg.Logger)
-	
+
+	// lomsClient := httpClient.NewOrder(cfg.HTTPLOMSClient)
 	lomsClient, err := grpcClient.NewOrder(cfg.GRPCLOMSClient)
 	if err != nil {
 		log.Fatal(err)

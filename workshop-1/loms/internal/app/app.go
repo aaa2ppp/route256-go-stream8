@@ -179,7 +179,7 @@ type grpcServer struct {
 }
 
 func newGRPCServer(cfg *config.GRPCServer, lomsService *service.LOMS) *grpcServer {
-	server := grpc.NewServer()
+	server := grpc.NewServer(grpc.UnaryInterceptor(middleware.GRPCLogging(slog.Default())))
 	order.RegisterOrderServer(server, grpcHandler.NewOrder(lomsService))
 	stock.RegisterStockServer(server, grpcHandler.NewStock(lomsService))
 
