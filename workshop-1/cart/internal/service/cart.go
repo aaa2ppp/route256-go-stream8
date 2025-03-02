@@ -38,7 +38,19 @@ func NewCart(cart CartStorage, order OrderStorage, product ProductStorage) *Cart
 }
 
 func (p *Cart) Add(ctx context.Context, req model.AddCartItemRequest) error {
+	countInCart, err := p.getCountInCart(ctx, req.UserID)
+	if err != nil {
+		return err
+	}
+	sreq := model.AddCartItemRequest{
+		UserID: req.UserID,
+		Items:  make([]model.CartItem, 0, len(req.Items)),
+	}
 	for _, item := range req.Items {
+		if item.Count == 0 {
+			// Игнорируем нулевые количества
+			continue
+		}
 
 		exists, err := p.isProductExists(ctx, req.Token, item.SKU)
 		if err != nil {
@@ -52,11 +64,25 @@ func (p *Cart) Add(ctx context.Context, req model.AddCartItemRequest) error {
 		if err != nil {
 			return err
 		}
-		if count < uint64(item.Count) {
+		if count < uint64(item.Count+countInCart[item.SKU]) {
 			return model.ErrPreconditionFailed
 		}
+
+		sreq.Items = append(sreq.Items, item)
 	}
-	return p.cart.Add(ctx, req)
+	return p.cart.Add(ctx, sreq)
+}
+
+func (p *Cart) getCountInCart(ctx context.Context, userID model.UserID) (map[model.SKU]uint16, error) {
+	cartItems, err := p.cart.List(ctx, userID)
+	if err != nil && !errors.Is(err, model.ErrNotFound) {
+		return nil, fmt.Errorf("failed to list cart items: %w", err)
+	}
+	countInCart := make(map[model.SKU]uint16, len(cartItems))
+	for _, item := range cartItems {
+		countInCart[item.SKU] = item.Count
+	}
+	return countInCart, nil
 }
 
 func (p *Cart) isProductExists(ctx context.Context, token string, sku model.SKU) (bool, error) {
@@ -114,6 +140,12 @@ func (p *Cart) List(ctx context.Context, req model.CartListRequest) (resp model.
 
 	var skusToDelete []model.SKU
 	for _, item := range cartItems {
+		if item.Count == 0 {
+			// Товара нет в корзине
+			log.Warn("no product in cart, it will be deleted", "SKU", item.SKU)
+			skusToDelete = append(skusToDelete, item.SKU)
+			continue
+		}
 		product, err := p.product.GetInfo(ctx, model.GetProductRequest{
 			Token: req.Token,
 			SKU:   item.SKU,
