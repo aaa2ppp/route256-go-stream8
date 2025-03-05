@@ -7,8 +7,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"syscall"
-
 	"route256/cart/internal/config"
 	grpcClient "route256/cart/internal/grpc/client"
 	httpClient "route256/cart/internal/http/client"
@@ -16,6 +14,7 @@ import (
 	"route256/cart/internal/memstor"
 	"route256/cart/internal/service"
 	"route256/cart/pkg/http/middleware"
+	"syscall"
 )
 
 func Run() int {

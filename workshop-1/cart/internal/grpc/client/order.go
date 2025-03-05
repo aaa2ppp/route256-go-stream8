@@ -3,7 +3,6 @@ package client
 import (
 	"context"
 	"fmt"
-
 	"route256/cart/internal/config"
 	"route256/cart/internal/model"
 	"route256/cart/internal/service"

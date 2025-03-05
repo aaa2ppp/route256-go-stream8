@@ -7,9 +7,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
-	"syscall"
-
 	"route256/cart/pkg/http/middleware"
 	"route256/loms/internal/config"
 	grpcHandler "route256/loms/internal/grpc/handler"
@@ -18,6 +15,8 @@ import (
 	"route256/loms/internal/service"
 	"route256/loms/pkg/api/order/v1"
 	"route256/loms/pkg/api/stock/v1"
+	"sync"
+	"syscall"
 
 	"google.golang.org/grpc"
 )
