@@ -6,3 +6,4 @@ mem.bin
 cpu.out
 cpu.bin
 all_go_code.out
+.env

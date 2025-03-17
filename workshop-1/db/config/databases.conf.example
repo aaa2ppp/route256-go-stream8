@@ -1,0 +1,13 @@
+db_list_to_create='cart order stock'
+
+db_cart_name=cart
+db_cart_user=cart
+db_cart_password='cart_Pa$sw0rd'
+
+db_order_name=order
+db_order_user=order
+db_order_password='order_Pa$sw0rd'
+
+db_stock_name=stock
+db_stock_user=stock
+db_stock_password='stock_Pa$sw0rd'
