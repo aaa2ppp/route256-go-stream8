@@ -63,6 +63,8 @@ $(foreach dep,$(BIN_DEPS),$(eval $(call GEN_BIN_RULE,$(dep))))
 clean-bin-deps:
 	-rm -fr $(BIN_TARGETS) .bin-deps
 
+generate:
+	:
 
 .PHONY: clean
 clean: clean-bin-deps

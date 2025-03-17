@@ -81,7 +81,7 @@ PROTOC_DEPS := \
 	github.com/envoyproxy/protoc-gen-validate@latest
 
 
-define GEN_PROTOC_DEPS_RULE
+define GEN_PROTOC_RULE
 bin/$$(notdir $$(firstword $$(subst @, ,$(1))))$(EXE):
 	$(GO_INSTALL) $(1)
 	$$(eval BIN := bin/$$(notdir $$(firstword $$(subst @, ,$(1))))$(EXE))
@@ -90,7 +90,7 @@ bin/$$(notdir $$(firstword $$(subst @, ,$(1))))$(EXE):
 PROTOC_TARGETS += bin/$$(notdir $$(firstword $$(subst @, ,$(1))))$(EXE)
 endef
 
-$(foreach dep,$(PROTOC_DEPS),$(eval $(call GEN_PROTOC_DEPS_RULE,$(dep))))
+$(foreach dep,$(PROTOC_DEPS),$(eval $(call GEN_PROTOC_RULE,$(dep))))
 
 .protoc-targets:
 	@echo $(PROTOC_TARGETS)
