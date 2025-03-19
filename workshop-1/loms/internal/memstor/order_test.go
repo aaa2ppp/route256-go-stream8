@@ -17,12 +17,11 @@ func TestOrder_Create(t *testing.T) {
 		Items:  []model.OrderItem{{SKU: 123, Count: 2}},
 	}
 
-	resp, err := storage.Create(ctx, req)
+	orderID, err := storage.Create(ctx, req)
 	assert.NoError(t, err)
-	assert.Equal(t, model.OrderID(1), resp.OrderID)
-	assert.Equal(t, model.OrderStatusNew, resp.Status)
+	assert.Equal(t, model.OrderID(1), orderID)
 
-	order, err := storage.GetByID(ctx, resp.OrderID)
+	order, err := storage.GetByID(ctx, orderID)
 	assert.NoError(t, err)
 	assert.Equal(t, req.UserID, order.UserID)
 	assert.Equal(t, req.Items, order.Items)
@@ -46,17 +45,17 @@ func TestOrder_SetStatus(t *testing.T) {
 		Items:  []model.OrderItem{{SKU: 123, Count: 2}},
 	}
 
-	resp, err := storage.Create(ctx, req)
+	orderID, err := storage.Create(ctx, req)
 	assert.NoError(t, err)
 
 	newStatus := model.OrderStatusPayed
 	err = storage.SetStatus(ctx, model.SetOrderStatusRequest{
-		OrderID: resp.OrderID,
+		OrderID: orderID,
 		Status:  newStatus,
 	})
 	assert.NoError(t, err)
 
-	order, err := storage.GetByID(ctx, resp.OrderID)
+	order, err := storage.GetByID(ctx, orderID)
 	assert.NoError(t, err)
 	assert.Equal(t, newStatus, order.Status)
 }

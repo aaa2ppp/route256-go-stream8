@@ -7,7 +7,7 @@ import (
 )
 
 type LomsService interface {
-	CreateOrder(ctx context.Context, req model.CreateOrderRequest) (resp model.CreateOrderResponse, err error)
+	CreateOrder(ctx context.Context, req model.CreateOrderRequest) (orderID model.OrderID, err error)
 	GetOrderInfo(ctx context.Context, orderID model.OrderID) (resp model.Order, err error)
 	PayOrder(ctx context.Context, orderID model.OrderID) error
 	CancelOrder(ctx context.Context, orderID model.OrderID) error
@@ -31,14 +31,14 @@ func (o Order) Create(ctx context.Context, req *order.CreateRequest) (*order.Cre
 	for _, item := range req.Items {
 		mreq.Items = append(mreq.Items, model.OrderItem{
 			SKU:   model.SKU(item.Sku),
-			Count: uint16(item.Count),
+			Count: int(item.Count),
 		})
 	}
-	mresp, err := o.service.CreateOrder(ctx, mreq)
+	orderID, err := o.service.CreateOrder(ctx, mreq)
 	if err != nil {
 		return nil, mapError(ctx, err)
 	}
-	return &order.CreateResponse{OrderID: int64(mresp.OrderID)}, nil
+	return &order.CreateResponse{OrderID: int64(orderID)}, nil
 }
 
 func (o Order) GetInfo(ctx context.Context, req *order.GetInfoRequest) (*order.GetInfoResponse, error) {

@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"os"
 	"time"
 )
 
@@ -20,11 +21,21 @@ type GRPCServer struct {
 	Addr string
 }
 
+type DB struct {
+	Addr          string
+	Name          string
+	User          string
+	Password      string
+	SSLMode       string
+	WaitUpTimeout time.Duration
+}
+
 type Config struct {
 	ShutdownTimeout time.Duration
 	Logger          *Logger
 	HTTPServer      *HTTPServer
 	GRPCServer      *GRPCServer
+	DB              *DB
 }
 
 func Load() (Config, error) {
@@ -41,6 +52,14 @@ func Load() (Config, error) {
 		},
 		GRPCServer: &GRPCServer{
 			Addr: ":50051",
+		},
+		DB: &DB{
+			Addr:          "db",
+			Name:          "loms",
+			User:          "loms",
+			Password:      os.Getenv("DB_PASSWORD"),
+			SSLMode:       "disable",
+			WaitUpTimeout: 30 * time.Second,
 		},
 	}, nil
 }

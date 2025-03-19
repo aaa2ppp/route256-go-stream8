@@ -1,0 +1,18 @@
+#/bin/sh
+
+# Usage: 
+#   migrate create <migration_name> sql
+#   migrate {up|down}
+# for more see `goose -h`
+
+. .env
+
+module=$(basename $(sed -n '1s/module //p' go.mod))
+
+export PGHOST=localhost
+export PGDATABASE=${DB_USER:-$module}
+export PGUSER=${DB_NAME:-$module}
+export PGPASSWORD=${DB_PASSWORD?required}
+export PGSSLMODE=disable
+
+GOOSE_MIGRATION_DIR=./migrations goose postgres '' "$@"

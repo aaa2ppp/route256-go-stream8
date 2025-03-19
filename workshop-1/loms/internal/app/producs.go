@@ -14,3 +14,5 @@ var productsForTest = []model.SKU{
 	4288068,
 	4465995,
 }
+
+var _ = productsForTest

@@ -1,18 +1,25 @@
 package model
 
 type (
-	UserID  int64
-	SKU     int32
 	OrderID int64
+	UserID  int64
+	SKU     int64
 )
 
-type OrderItem struct {
-	SKU   SKU
-	Count uint16
+type Order struct {
+	OrderID
+	UserID
+	Status OrderStatus
+	Items  []OrderItem
 }
 
-type Order struct {
-	Status OrderStatus
-	UserID
-	Items []OrderItem
+type OrderItem struct {
+	SKU
+	Count int
+}
+
+type Stock struct {
+	SKU
+	Count    int64
+	Reserved int64
 }

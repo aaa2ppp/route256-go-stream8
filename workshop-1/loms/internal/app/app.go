@@ -11,7 +11,9 @@ import (
 	"route256/loms/internal/config"
 	grpcHandler "route256/loms/internal/grpc/handler"
 	httpHandler "route256/loms/internal/http/handler"
-	"route256/loms/internal/memstor"
+	_ "route256/loms/internal/memstor"
+	orderRepo "route256/loms/internal/repo/order"
+	stockRepo "route256/loms/internal/repo/stock"
 	"route256/loms/internal/service"
 	"route256/loms/pkg/api/order/v1"
 	"route256/loms/pkg/api/stock/v1"
@@ -30,7 +32,19 @@ func Run() int {
 
 	setupDefaultLogger(cfg.Logger)
 
-	lomsService := createLOMSService()
+	dbpool, err := openDB(context.TODO(), cfg.DB)
+	if err != nil {
+		slog.Error("can't open database", "error", err)
+		return 1
+	}
+
+	orderStor := orderRepo.Adapter{Queries: orderRepo.New(dbpool)}
+	stockStor := stockRepo.Adapter{Queries: stockRepo.New(dbpool)}
+
+	lomsService := service.NewLOMS(
+		orderStor,
+		stockStor,
+	)
 
 	// Создаем менеджер и добавляем серверы
 	manager := &serverManager{}
@@ -63,14 +77,6 @@ func setupDefaultLogger(cfg *config.Logger) {
 		handler = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.Level})
 	}
 	slog.SetDefault(slog.New(handler).With("app", "loms"))
-}
-
-func createLOMSService() *service.LOMS {
-	// TODO: here using memstore for test only
-	return service.NewLOMS(
-		memstor.NewOrder(),
-		memstor.NewRandomStock(productsForTest),
-	)
 }
 
 // server представляет интерфейс для управления сервером.

@@ -26,7 +26,7 @@ func (o *Order) newOrderID() model.OrderID {
 }
 
 // Create implements service.OrderStorage.
-func (o *Order) Create(_ context.Context, req model.CreateOrderRequest) (model.CreateOrderResponse, error) {
+func (o *Order) Create(_ context.Context, req model.CreateOrderRequest) (model.OrderID, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
@@ -39,10 +39,7 @@ func (o *Order) Create(_ context.Context, req model.CreateOrderRequest) (model.C
 		Items:  slices.Clone(req.Items),
 	}
 
-	return model.CreateOrderResponse{
-		OrderID: orderID,
-		Status:  status,
-	}, nil
+	return orderID, nil
 }
 
 // GetByID implements service.OrderStorage.

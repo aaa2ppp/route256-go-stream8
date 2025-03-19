@@ -10,11 +10,11 @@ import (
 )
 
 type stockItem struct {
-	count    uint64
-	reserved uint64
+	count    int64
+	reserved int64
 }
 
-func (si stockItem) available() uint64 {
+func (si stockItem) available() int64 {
 	return si.count - si.reserved
 }
 
@@ -36,7 +36,7 @@ func NewRandomStock(producs []model.SKU) *Stock {
 	for _, sku := range producs {
 		items = append(items, StockItem{
 			SKU:   sku,
-			Count: rand.Uint64N(maxProductCount),
+			Count: rand.Int64N(maxProductCount),
 		})
 	}
 
@@ -47,7 +47,7 @@ func NewRandomStock(producs []model.SKU) *Stock {
 
 type StockItem struct {
 	SKU   model.SKU
-	Count uint64
+	Count int64
 }
 
 func (s *Stock) Init(items []StockItem) {
@@ -60,16 +60,20 @@ func (s *Stock) Init(items []StockItem) {
 	}
 }
 
-// GetInfo implements service.StockStorage.
-func (s *Stock) GetInfo(_ context.Context, sku model.SKU) (count uint64, err error) {
+// GetBySKU implements service.StockStorage.
+func (s *Stock) GetBySKU(_ context.Context, sku model.SKU) (_ model.Stock, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	item, exists := s.items[sku]
 	if !exists {
-		return 0, model.ErrNotFound
+		return model.Stock{}, model.ErrNotFound
 	}
-	return item.available(), nil
+	return model.Stock{
+		SKU:      sku,
+		Count:    int64(item.count),
+		Reserved: int64(item.reserved),
+	}, nil
 }
 
 // Reserve implements service.StockStorage.
@@ -83,10 +87,11 @@ func (s *Stock) Reserve(_ context.Context, orderItems []model.OrderItem) error {
 	}
 
 	for i := range stockItems {
-		if stockItems[i].available() < uint64(orderItems[i].Count) {
+		n := int64(orderItems[i].Count)
+		if stockItems[i].available() < n {
 			return fmt.Errorf("insufficient available SKU=%v", orderItems[i].SKU)
 		}
-		stockItems[i].reserved += uint64(orderItems[i].Count)
+		stockItems[i].reserved += n
 	}
 
 	for i := range stockItems {
@@ -107,10 +112,11 @@ func (s *Stock) ReserveCancel(_ context.Context, orderItems []model.OrderItem) e
 	}
 
 	for i := range stockItems {
-		if stockItems[i].reserved < uint64(orderItems[i].Count) {
+		n := int64(orderItems[i].Count)
+		if stockItems[i].reserved < n {
 			return fmt.Errorf("insufficient reserved SKU=%v", orderItems[i].SKU)
 		}
-		stockItems[i].reserved -= uint64(orderItems[i].Count)
+		stockItems[i].reserved -= n
 	}
 
 	for i := range stockItems {
@@ -131,10 +137,13 @@ func (s *Stock) ReserveRemove(_ context.Context, orderItems []model.OrderItem) e
 	}
 
 	for i := range stockItems {
-		if stockItems[i].reserved < uint64(orderItems[i].Count) {
+		n := int64(orderItems[i].Count)
+		if stockItems[i].reserved < n {
+			return fmt.Errorf("insufficient count SKU=%v", orderItems[i].SKU)
+		}
+		if stockItems[i].reserved < n {
 			return fmt.Errorf("insufficient reserved SKU=%v", orderItems[i].SKU)
 		}
-		n := uint64(orderItems[i].Count)
 		stockItems[i].count -= n
 		stockItems[i].reserved -= n
 	}

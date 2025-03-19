@@ -6,7 +6,7 @@ import (
 )
 
 type OrderStorage interface {
-	Create(ctx context.Context, req model.CreateOrderRequest) (model.CreateOrderResponse, error)
+	Create(ctx context.Context, req model.CreateOrderRequest) (model.OrderID, error)
 	SetStatus(ctx context.Context, req model.SetOrderStatusRequest) error
 	GetByID(ctx context.Context, orderID model.OrderID) (model.Order, error)
 }
@@ -15,7 +15,7 @@ type StockStorage interface {
 	Reserve(ctx context.Context, items []model.OrderItem) error
 	ReserveRemove(ctx context.Context, items []model.OrderItem) error
 	ReserveCancel(ctx context.Context, items []model.OrderItem) error
-	GetInfo(ctx context.Context, sku model.SKU) (count uint64, err error)
+	GetBySKU(ctx context.Context, sku model.SKU) (stock model.Stock, err error)
 }
 
 type LOMS struct {
@@ -30,12 +30,12 @@ func NewLOMS(order OrderStorage, stock StockStorage) *LOMS {
 	}
 }
 
-func (p *LOMS) CreateOrder(ctx context.Context, req model.CreateOrderRequest) (resp model.CreateOrderResponse, err error) {
+func (p *LOMS) CreateOrder(ctx context.Context, req model.CreateOrderRequest) (orderID model.OrderID, err error) {
 	log := getLogger(ctx, "LOMS.CreateOrder")
 
-	resp, err = p.order.Create(ctx, req)
+	orderID, err = p.order.Create(ctx, req)
 	if err != nil {
-		return resp, err
+		return orderID, err
 	}
 
 	var status model.OrderStatus
@@ -46,19 +46,17 @@ func (p *LOMS) CreateOrder(ctx context.Context, req model.CreateOrderRequest) (r
 	}
 
 	if err := p.order.SetStatus(ctx, model.SetOrderStatusRequest{
-		OrderID: resp.OrderID,
+		OrderID: orderID,
 		Status:  status,
 	}); err != nil {
 		log.Error("can't set order status", "error", err)
-		return resp, model.ErrInternalError
+		return 0, model.ErrInternalError
 	}
 
-	resp.Status = status
-
-	if resp.Status == model.OrderStatusAwaitingPayment {
-		return resp, nil
+	if status == model.OrderStatusAwaitingPayment {
+		return orderID, nil
 	} else {
-		return resp, model.ErrPreconditionFailed
+		return 0, model.ErrPreconditionFailed
 	}
 }
 
@@ -125,5 +123,9 @@ func (p *LOMS) CancelOrder(ctx context.Context, orderID model.OrderID) error {
 }
 
 func (p *LOMS) GetStockInfo(ctx context.Context, sku model.SKU) (count uint64, err error) {
-	return p.stock.GetInfo(ctx, sku)
+	stock, err := p.stock.GetBySKU(ctx, sku)
+	if err != nil {
+		return 0, err
+	}
+	return uint64(stock.Count - stock.Reserved), nil
 }

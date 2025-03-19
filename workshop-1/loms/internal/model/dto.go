@@ -5,9 +5,7 @@ type CreateOrderRequest struct {
 	Items  []OrderItem
 }
 
-type CreateOrderResponse struct {
+type SetOrderStatusRequest struct {
 	OrderID OrderID
 	Status  OrderStatus
 }
-
-type SetOrderStatusRequest = CreateOrderResponse

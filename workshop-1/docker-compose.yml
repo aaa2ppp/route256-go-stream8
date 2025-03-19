@@ -12,8 +12,12 @@ services:
   loms:
     image: loms
     build: ./loms/
+    env_file:
+      - ./loms/.env
     ports:
       - "8083:8080"
+    depends_on:
+      - db
   # notification:
   #   image: notification
   #   build: ./notification
