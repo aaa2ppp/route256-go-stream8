@@ -60,6 +60,8 @@ main() {
 				SELECT FROM pg_database 
 				WHERE datname = '${name}'
 			)\\gexec
+
+			\\connect ${name}
 			
 			DO \$\$
 			BEGIN
@@ -72,9 +74,15 @@ main() {
 						'${user}',
 						'${escaped_password}'
 					);
-					GRANT ALL PRIVILEGES 
-					ON DATABASE "${name}" 
-					TO "${user}";
+
+					-- Отзываем публичные права для безопасности
+					REVOKE ALL ON SCHEMA public FROM PUBLIC;
+
+					-- Сделать пользователя владельцем базы
+					ALTER DATABASE "${name}" OWNER TO "${user}";
+
+					-- Сделать пользователя владельцем схемы public
+					ALTER SCHEMA public OWNER TO "${user}";
 				END IF;
 			END
 			\$\$;
