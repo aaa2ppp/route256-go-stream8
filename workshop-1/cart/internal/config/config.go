@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"os"
 	"time"
 )
 
@@ -34,12 +35,22 @@ type GRPCLOMSClient struct {
 	Addr string
 }
 
+type DB struct {
+	Addr          string
+	Name          string
+	User          string
+	Password      string
+	SSLMode       string
+	WaitUpTimeout time.Duration
+}
+
 type Config struct {
 	Logger            *Logger
 	HTTPServer        *HTTPServer
 	HTTPLOMSClient    *HTTPLOMSClient
 	HTTPProductClient *HTTPProductClient
 	GRPCLOMSClient    *GRPCLOMSClient
+	DB                *DB
 }
 
 func Load() (Config, error) {
@@ -67,6 +78,14 @@ func Load() (Config, error) {
 		},
 		GRPCLOMSClient: &GRPCLOMSClient{
 			Addr: "loms:50051",
+		},
+		DB: &DB{
+			Addr:          "db",
+			Name:          "cart",
+			User:          "cart",
+			Password:      os.Getenv("DB_PASSWORD"),
+			SSLMode:       "disable",
+			WaitUpTimeout: 30 * time.Second,
 		},
 	}, nil
 }

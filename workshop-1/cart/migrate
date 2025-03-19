@@ -1,0 +1,16 @@
+#/bin/sh
+
+# Usage: 
+#   migrate create <migration_name> sql
+#   migrate {up|down}
+# for more see `goose -h`
+
+. .env
+
+export PGHOST=localhost
+export PGDATABASE=${DB_USER:-cart}
+export PGUSER=${DB_NAME:-cart}
+export PGPASSWORD=${DB_PASSWORD?required}
+export PGSSLMODE=disable
+
+GOOSE_MIGRATION_DIR=./migrations goose postgres '' "$@"

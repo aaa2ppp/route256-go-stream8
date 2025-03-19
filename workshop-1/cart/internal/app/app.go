@@ -11,7 +11,7 @@ import (
 	grpcClient "route256/cart/internal/grpc/client"
 	httpClient "route256/cart/internal/http/client"
 	"route256/cart/internal/http/handler"
-	"route256/cart/internal/memstor"
+	cartRepo "route256/cart/internal/repo/cart"
 	"route256/cart/internal/service"
 	"route256/cart/pkg/http/middleware"
 	"syscall"
@@ -25,16 +25,29 @@ func Run() int {
 
 	setupDefaultLogger(cfg.Logger)
 
+	dbpool, err := openDB(context.Background(), cfg.DB)
+	if err != nil {
+		slog.Error(err.Error())
+		return 1
+	}
+	defer dbpool.Close()
+
+	// cartStor := memstor.NewCart()
+	cartStor := cartRepo.Adapter{Queries: cartRepo.New(dbpool)}
+
 	// lomsClient := httpClient.NewOrder(cfg.HTTPLOMSClient)
 	lomsClient, err := grpcClient.NewOrder(cfg.GRPCLOMSClient)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error(err.Error())
+		return 1
 	}
 
+	productClient := httpClient.NewProduct(cfg.HTTPProductClient)
+
 	cartService := service.NewCart(
-		memstor.NewCart(),
+		cartStor,
 		lomsClient,
-		httpClient.NewProduct(cfg.HTTPProductClient),
+		productClient,
 	)
 
 	mux := http.NewServeMux()
