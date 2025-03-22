@@ -1,6 +1,6 @@
 -- +goose Up
 -- +goose StatementBegin
-INSERT INTO stock (sku, count) VALUES
+INSERT INTO stock (sku, available) VALUES
 (1076963, 10),
 (1148162, 10),
 (1625903, 10),

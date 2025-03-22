@@ -127,5 +127,5 @@ func (p *LOMS) GetStockInfo(ctx context.Context, sku model.SKU) (count uint64, e
 	if err != nil {
 		return 0, err
 	}
-	return uint64(stock.Count - stock.Reserved), nil
+	return uint64(stock.Available), nil
 }

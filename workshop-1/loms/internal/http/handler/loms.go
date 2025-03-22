@@ -10,7 +10,7 @@ import (
 
 type orderItem struct {
 	SKU   model.SKU `json:"sku"`
-	Count int       `json:"count"`
+	Count uint16    `json:"count"`
 }
 
 type createOrderRequest struct {

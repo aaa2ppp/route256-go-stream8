@@ -13,8 +13,8 @@ func TestStock(t *testing.T) {
 	stock := NewStock()
 
 	// Добавим тестовые данные
-	stock.items[model.SKU(1)] = stockItem{count: 10, reserved: 0}
-	stock.items[model.SKU(2)] = stockItem{count: 5, reserved: 0}
+	stock.items[1] = model.Stock{SKU: 1, Available: 10, Reserved: 0}
+	stock.items[2] = model.Stock{SKU: 2, Available: 5, Reserved: 0}
 	// 	id	count	reserved
 	// 	1	10		0
 	//	2	5		0
@@ -22,7 +22,7 @@ func TestStock(t *testing.T) {
 	t.Run("GetInfo - existing SKU", func(t *testing.T) {
 		count, err := stock.GetBySKU(ctx, model.SKU(1))
 		assert.NoError(t, err)
-		assert.Equal(t, model.Stock{SKU: 1, Count: 10, Reserved: 0}, count)
+		assert.Equal(t, model.Stock{SKU: 1, Available: 10, Reserved: 0}, count)
 	})
 
 	t.Run("GetInfo - non-existing SKU", func(t *testing.T) {
@@ -34,10 +34,10 @@ func TestStock(t *testing.T) {
 		err := stock.Reserve(ctx, []model.OrderItem{{SKU: model.SKU(1), Count: 3}})
 		assert.NoError(t, err)
 		count, _ := stock.GetBySKU(ctx, model.SKU(1))
-		assert.Equal(t, model.Stock{SKU: 1, Count: 10, Reserved: 3}, count)
+		assert.Equal(t, model.Stock{SKU: 1, Available: 7, Reserved: 3}, count)
 	})
 	// 	id	count	reserved
-	// 	1	10		3
+	// 	1	7		3
 	//	2	5		0
 
 	t.Run("Reserve - insufficient available", func(t *testing.T) {
@@ -49,17 +49,17 @@ func TestStock(t *testing.T) {
 		err := stock.ReserveCancel(ctx, []model.OrderItem{{SKU: model.SKU(1), Count: 2}})
 		assert.NoError(t, err)
 		count, _ := stock.GetBySKU(ctx, model.SKU(1))
-		assert.Equal(t, model.Stock{SKU: 1, Count: 10, Reserved: 1}, count)
+		assert.Equal(t, model.Stock{SKU: 1, Available: 9, Reserved: 1}, count)
 	})
 	// 	id	count	reserved
-	// 	1	10		1
+	// 	1	9		1
 	//	2	5		0
 
 	t.Run("ReserveRemove - success", func(t *testing.T) {
 		err := stock.ReserveRemove(ctx, []model.OrderItem{{SKU: model.SKU(1), Count: 1}})
 		assert.NoError(t, err)
 		count, _ := stock.GetBySKU(ctx, model.SKU(1))
-		assert.Equal(t, model.Stock{SKU: 1, Count: 9, Reserved: 0}, count)
+		assert.Equal(t, model.Stock{SKU: 1, Available: 9, Reserved: 0}, count)
 	})
 	// 	id	count	reserved
 	// 	1	9		0

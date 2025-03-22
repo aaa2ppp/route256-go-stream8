@@ -1,0 +1,613 @@
+// === cart/Dockerfile ===
+FROM scratch
+
+ADD ./bin/app /app
+
+CMD ["/app"]
+
+// === cart/Makefile ===
+GOVER   := $(shell go env GOVERSION)
+MODULE  := $(shell sed -n '1s/module //p' go.mod)
+PACKAGE := $(MODULE)/cmd/app
+
+# Для виндовс содержить расширение .exe или пустую строку для других систем
+EXE := $(if $(filter windows,$(shell go env GOOS)),.exe)
+
+SMARTIMPORTS := bin/smartimports_$(GOVER)$(EXE)
+LINTVER := v1.64.4
+LINTBIN := bin/lint_$(GOVER)_$(LINTVER)$(EXE)
+
+all: format build test lint
+
+build:
+	GOOS=$(TARGET_OS) GOARCH=$(TARGET_ARCH) go build -o bin/app $(PACKAGE)
+
+test:
+	go test ./...
+
+run:
+	go run $(PACKAGE)
+
+lint: install-lint
+	$(LINTBIN) run
+
+precommit: format build test lint
+	@echo "OK"
+
+format: install-smartimports
+	$(SMARTIMPORTS) -exclude internal/mocks
+
+install-lint: $(LINTBIN)
+
+install-smartimports: $(SMARTIMPORTS)
+
+# Инсталяция бинарных зависимостей
+
+# Интсталируем в локальный bin
+GO_INSTALL := GOBIN=$(PWD)/bin go install
+
+# Зависимости которые нужно устновить
+BIN_DEPS := \
+	github.com/golangci/golangci-lint/cmd/golangci-lint@$(LINTVER);$(LINTBIN) \
+	github.com/pav5000/smartimports/cmd/smartimports@latest;$(SMARTIMPORTS)
+
+define GEN_BIN_RULE
+$$(lastword $$(subst ;, ,$(1))):
+	$(GO_INSTALL) $$(firstword $$(subst ;, ,$(1)))
+	mv bin/$$(notdir $$(firstword $$(subst @, ,$(1))))$(EXE) $$@
+
+BIN_TARGETS += $$(lastword $$(subst ;, ,$(1)))
+endef
+
+$(foreach dep,$(BIN_DEPS),$(eval $(call GEN_BIN_RULE,$(dep))))
+
+.bin-targets:
+	@echo $(BIN_TARGETS)
+
+.bin-deps: $(BIN_TARGETS)
+	@touch $@
+
+.PHONY: clean-bin-deps
+clean-bin-deps:
+	-rm -fr $(BIN_TARGETS) .bin-deps
+
+generate:
+	:
+
+.PHONY: clean
+clean: clean-bin-deps
+	-rm -fr bin
+
+// === db/initdb.d/000-create-databases.sh ===
+#!/bin/sh
+set -eu
+
+. /config/databases.conf
+
+# Проверка корректности идентификатора
+validate_identifier() {
+	case $1 in
+		*[!a-zA-Z0-9_]*|"")
+			echo "$(basename "$0"): Invalid identifier '$1'" >&2
+			return 1
+			;;
+		*) 
+			return 0 
+			;;
+	esac
+}
+
+var_is_empty() {
+	eval test -z \"\${${1}-}\"
+}
+
+get_db_var() {
+	local var_name="db_${1}_${2}"
+	if var_is_empty "$var_name"; then
+		echo "$(basename "$0"): $var_name not set" >&2
+		return 1
+	fi
+	eval $2=\${$var_name}
+}
+
+# Экранирование апострофов для SQL
+sql_escape() {
+	echo "$1" | sed "s/'/''/g"
+}
+
+main() {
+	# Проверка обязательной переменной
+	: ${db_list_to_create:?Environment variable db_list_to_create not set}
+	
+	for db in $db_list_to_create; do
+		# Валидация имени шаблона
+		validate_identifier "$db" || continue
+
+		# Чтение переменных
+		get_db_var $db name     || continue
+		get_db_var $db user     || continue
+		get_db_var $db password || continue
+
+		validate_identifier "$name" || continue
+		validate_identifier "$user" || continue
+		escaped_password=$(sql_escape "$password")
+
+		echo "Processing: $name" >&2
+		
+		# Безопасный SQL через HEREDOC
+		psql -U postgres -v ON_ERROR_STOP=1 <<-SQL
+			SELECT 'CREATE DATABASE "${name}"' 
+			WHERE NOT EXISTS (
+				SELECT FROM pg_database 
+				WHERE datname = '${name}'
+			)\\gexec
+
+			\\connect ${name}
+			
+			DO \$\$
+			BEGIN
+				IF NOT EXISTS (
+					SELECT FROM pg_roles 
+					WHERE rolname = '${user}'
+				) THEN
+					EXECUTE format(
+						'CREATE USER %I WITH PASSWORD %L',
+						'${user}',
+						'${escaped_password}'
+					);
+
+					-- Отзываем публичные права для безопасности
+					REVOKE ALL ON SCHEMA public FROM PUBLIC;
+
+					-- Сделать пользователя владельцем базы
+					ALTER DATABASE "${name}" OWNER TO "${user}";
+
+					-- Сделать пользователя владельцем схемы public
+					ALTER SCHEMA public OWNER TO "${user}";
+				END IF;
+			END
+			\$\$;
+		SQL
+	done
+}
+
+main "$@"
+
+// === docker-compose.yml ===
+services:
+  cart:
+    image: cart
+    build: ./cart/
+    env_file:
+      - ./cart/.env
+    ports:
+      - "8082:8080"
+    depends_on:
+      - loms
+      - db
+  loms:
+    image: loms
+    build: ./loms/
+    env_file:
+      - ./loms/.env
+    ports:
+      - "8083:8080"
+    depends_on:
+      - db
+  # notification:
+  #   image: notification
+  #   build: ./notification
+  #   ports:
+  #     - "8082:8082"
+  db:
+    image: postgres:17.2
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db/config:/config
+      - ./db/initdb.d:/docker-entrypoint-initdb.d
+      - ./db/.docker/postgresql/data:/var/lib/postgresql/data
+
+// === loms/api/order/v1/order.proto ===
+syntax = "proto3";
+
+package route256.loms.pkg.api.order.v1;
+
+option go_package = "route256/loms/pkg/order/v1;order";
+
+// imports
+
+service Order {
+    rpc Create(CreateRequest) returns (CreateResponse) {}
+    rpc GetInfo(GetInfoRequest) returns (GetInfoResponse) {}
+    rpc Pay(PayRequest) returns (PayResponse) {}
+    rpc Cancel(CancelRequest) returns (CancelResponse) {}
+}
+
+message Item {
+    int32 sku = 1;
+    uint32 count = 2;
+}
+
+message CreateRequest {
+    int64 user = 1;
+    repeated Item items = 2;
+}
+
+message CreateResponse {
+    int64 orderID = 1;
+}
+
+message GetInfoRequest {
+    int64 orderID = 1;
+}
+
+enum OrderStatus {
+    NEW = 0;
+    AWAITING_PAYMENT = 1;
+    FAILED = 2;
+    PAYED = 3;
+    CANCELLED = 4;
+}
+
+message GetInfoResponse {
+    OrderStatus status = 1;
+    int64 user = 2;
+    repeated Item items = 3;
+}
+
+message PayRequest {
+    int64 orderID = 1;
+}
+
+message PayResponse {
+
+}
+
+message CancelRequest {
+    int64 orderID = 1;
+}
+
+message CancelResponse {
+
+}
+
+// === loms/api/stock/v1/stock.proto ===
+syntax = "proto3";
+
+package route256.loms.pkg.api.stock.v1;
+
+option go_package = "route256/loms/pkg/stock/v1;stock";
+
+// imports
+
+service Stock {
+    rpc GetInfo(GetInfoRequest) returns (GetInfoResponse) {}
+}
+
+message GetInfoRequest {
+    int32 sku = 1;
+}
+
+message GetInfoResponse {
+    uint64 count = 1;
+}
+
+
+// === loms/Dockerfile ===
+FROM scratch
+
+ADD ./bin/app /app
+
+CMD ["/app"]
+
+// === loms/Makefile ===
+SHELL := bash -euo pipefail
+.DELETE_ON_ERROR:
+
+
+GOVER   := $(shell go env GOVERSION)
+MODULE  := $(shell sed -n '1s/module //p' go.mod)
+PACKAGE := $(MODULE)/cmd/app
+
+# Для виндовс содержить расширение .exe или пустую строку для других систем
+EXE := $(if $(filter windows,$(shell go env GOOS)),.exe)
+
+SMARTIMPORTS := bin/smartimports_$(GOVER)$(EXE)
+LINTVER := v1.64.4
+LINTBIN := bin/lint_$(GOVER)_$(LINTVER)$(EXE)
+
+all: format build test lint
+
+build: generate
+	GOOS=$(TARGET_OS) GOARCH=$(TARGET_ARCH) go build -o bin/app $(PACKAGE)
+
+test:
+	go test ./...
+
+run:
+	go run $(PACKAGE)
+
+lint: install-lint
+	$(LINTBIN) run
+
+precommit: format build test lint
+	@echo "OK"
+
+format: install-smartimports
+	$(SMARTIMPORTS) -exclude internal/mocks
+
+install-lint: $(LINTBIN)
+
+install-smartimports: $(SMARTIMPORTS)
+
+# Инсталяция бинарных зависимостей
+
+# Интсталируем в локальный bin
+GO_INSTALL := GOBIN=$(PWD)/bin go install
+
+# Зависимости которые нужно устновить
+BIN_DEPS := \
+	github.com/golangci/golangci-lint/cmd/golangci-lint@$(LINTVER);$(LINTBIN) \
+	github.com/pav5000/smartimports/cmd/smartimports@latest;$(SMARTIMPORTS)
+
+define GEN_BIN_RULE
+$$(lastword $$(subst ;, ,$(1))):
+	$(GO_INSTALL) $$(firstword $$(subst ;, ,$(1)))
+	$$(eval BIN := bin/$$(notdir $$(firstword $$(subst @, ,$(1))))$(EXE))
+	@test -f $$(BIN) || { echo "$$(BIN) not found"; exit 1; }
+	mv $$(BIN) $$@
+
+BIN_TARGETS += $$(lastword $$(subst ;, ,$(1)))
+endef
+
+$(foreach dep,$(BIN_DEPS),$(eval $(call GEN_BIN_RULE,$(dep))))
+
+.bin-targets:
+	@echo $(BIN_TARGETS)
+
+.bin-deps: $(BIN_TARGETS)
+	touch $@
+
+.PHONY: clean-bin-deps
+clean-bin-deps:
+	-rm -fr $(BIN_TARGETS) .bin-deps
+
+
+# Инсталяция плагинов protoc
+
+# Список плагинов protoc, их путей и версий
+PROTOC_DEPS := \
+	google.golang.org/protobuf/cmd/protoc-gen-go@latest \
+	google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest \
+	github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-grpc-gateway@latest \
+	github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-openapiv2@latest \
+	github.com/envoyproxy/protoc-gen-validate@latest
+
+
+define GEN_PROTOC_RULE
+bin/$$(notdir $$(firstword $$(subst @, ,$(1))))$(EXE):
+	$(GO_INSTALL) $(1)
+	$$(eval BIN := bin/$$(notdir $$(firstword $$(subst @, ,$(1))))$(EXE))
+	@test -f $$(BIN) || { echo "$$(BIN) not found"; exit 1; }
+
+PROTOC_TARGETS += bin/$$(notdir $$(firstword $$(subst @, ,$(1))))$(EXE)
+endef
+
+$(foreach dep,$(PROTOC_DEPS),$(eval $(call GEN_PROTOC_RULE,$(dep))))
+
+.protoc-targets:
+	@echo $(PROTOC_TARGETS)
+
+.protoc-deps: $(PROTOC_TARGETS)
+	touch $@
+
+.PHONY: clean-protoc-deps
+clean-protoc-deps:
+	-rm -fr $(PROTOC_TARGETS) .protoc-deps
+
+
+# Вендоринг внешних proto файлов
+
+VENDOR_DIR = vendor-proto
+GIT_CLONE = git clone -q --single-branch -n --filter=tree:0
+GIT_CHECKOUT = git sparse-checkout set --no-cone
+
+# Список зависимостей для вендоринга
+VENDOR_DEPS = \
+    google/api;master;https://github.com/googleapis/googleapis;google/api \
+    protoc-gen-openapiv2/options;main;https://github.com/grpc-ecosystem/grpc-gateway;protoc-gen-openapiv2/options \
+    google/protobuf;main;https://github.com/protocolbuffers/protobuf;src/google/protobuf \
+    validate;main;https://github.com/bufbuild/protoc-gen-validate;validate
+
+define GEN_VENDOR_RULE
+$(VENDOR_DIR)/$$(firstword $$(subst ;, ,$(1))):
+	$$(eval TEMP_DIR := $$(shell mkdir -p $(VENDOR_DIR) && mktemp -d $(VENDOR_DIR)/tmp.XXXXXXXX))
+	$$(eval PARAMS   := $$(wordlist 2, 999, $(subst ;, ,$(1))))
+	$$(eval BRANCH   := $$(word 1,$$(PARAMS)))
+	$$(eval REPO_URL := $$(word 2,$$(PARAMS)))
+	$$(eval SRC_PATH := $$(word 3,$$(PARAMS)))
+
+	$(GIT_CLONE) -b $$(BRANCH) --depth=1 $$(REPO_URL) $$(TEMP_DIR)
+	cd $$(TEMP_DIR) && $(GIT_CHECKOUT) $$(SRC_PATH) && git checkout -q
+	mkdir -p $$(@D) && mv $$(TEMP_DIR)/$$(SRC_PATH) $$@
+	rm -fr $$(TEMP_DIR)
+
+VENDOR_TARGETS += $(VENDOR_DIR)/$$(firstword $$(subst ;, ,$(1)))
+endef
+
+$(foreach dep,$(VENDOR_DEPS),$(eval $(call GEN_VENDOR_RULE,$(dep))))
+
+.vendor-targets:
+	@echo $(VENDOR_TARGETS)
+
+.vendor-deps: $(VENDOR_TARGETS)
+	touch .vendor-deps
+
+.PHONY: clean-vendor-deps
+clean-vendor-deps:
+	-rm -fr $(VENDOR_TARGETS) .vendor-deps
+
+
+# Генерация сервисов по их ptoto описаниям
+
+# Список proto описаний сервисов
+SERVICE_PROTOS := \
+	api/order/v1/order.proto \
+	api/stock/v1/stock.proto
+
+define GEN_SERVICE_RULE
+pkg/$$(dir $(1)): $(1) .protoc-deps .vendor-deps
+	mkdir -p $$@
+	-rm -fr $$@/*
+	protoc -I $$(dir $$<) -I vendor-proto \
+		--plugin=bin/protoc-gen-go$$(EXE) --go_out $$@ --go_opt paths=source_relative \
+		--plugin=bin/protoc-gen-go-grpc$$(EXE) --go-grpc_out $$@ --go-grpc_opt paths=source_relative \
+		$$<
+
+SERVICE_TARGETS += pkg/$$(dir $(1))
+endef
+
+$(foreach service,$(SERVICE_PROTOS),$(eval $(call GEN_SERVICE_RULE,$(service))))
+
+.service-targets:
+	@echo $(SERVICE_TARGETS)
+
+.PHONY: generate
+generate: .generate
+
+.PHONY: clean-generate
+.generate: $(SERVICE_TARGETS) .protoc-deps .vendor-deps
+	touch $@
+clean-generate:
+	-rm -fr $(SERVICE_TARGETS) .generate
+
+
+# clean
+
+.PHONY: clean
+clean: clean-bin-deps clean-protoc-deps clean-vendor-deps clean-generate
+	-rm -fr bin
+
+// === Makefile ===
+generate-all:
+	cd loms && TARGET_OS=linux TARGET_ARCH=amd64 make generate
+	cd cart && TARGET_OS=linux TARGET_ARCH=amd64 make generate
+	cd notifications && TARGET_OS=linux TARGET_ARCH=amd64 make generate
+
+build-all: generate-all
+	cd loms && TARGET_OS=linux TARGET_ARCH=amd64 make build
+	cd cart && TARGET_OS=linux TARGET_ARCH=amd64 make build
+	cd notifications && TARGET_OS=linux TARGET_ARCH=amd64 make build
+
+run-all: build-all
+	docker-compose up --force-recreate --build
+
+precommit:
+	cd loms && make precommit
+	cd cart && make precommit
+	cd notifications && make precommit
+
+clean-all:
+	cd loms && make clean
+	cd cart && make clean
+	cd notifications && make clean
+
+// === merge_code.sh ===
+#!/bin/sh
+
+find . \( -type d \( -name api -o -name 'vendor*' \) -o -type f -name '*_test.go' \) -prune \
+    -o -type f -name "*.go" -exec sh -c 'f={};printf "// === ${f#./} ===\n";cat $f;echo' ';' > merged_go_files.txt
+
+// === merge_code2.sh ===
+#!/bin/sh
+
+# find . \( -type d \( -name api -o -name 'vendor*' \) -o -type f -name '*_test.go' \) -prune \
+#     -o -type f -name "*.go" -exec sh -c 'f={};printf "// === ${f#./} ===\n";cat $f;echo' ';' > merged_go_files.txt
+
+find . \( -type d -name 'vendor*' \) -prune \
+    -o \( \
+        -type f -name 'Dockerfile' \
+        -o -type f -name 'docker-compose.yml' \
+        -o -type f -name 'Makefile' \
+        -o -type f -name '*.mk' \
+        -o -type f -name '*.sh' \
+        -o -type f -name '*.proto' \
+    \) \
+    -exec sh -c 'f={};printf "// === ${f#./} ===\n";cat $f;echo' ';'
+// === notifications/Makefile ===
+GOVER   := $(shell go env GOVERSION)
+MODULE  := $(shell sed -n '1s/module //p' go.mod)
+PACKAGE := $(MODULE)/cmd/app
+
+# Для виндовс содержить расширение .exe или пустую строку для других систем
+EXE := $(if $(filter windows,$(shell go env GOOS)),.exe)
+
+SMARTIMPORTS := bin/smartimports_$(GOVER)$(EXE)
+LINTVER := v1.64.4
+LINTBIN := bin/lint_$(GOVER)_$(LINTVER)$(EXE)
+
+all: format build test lint
+
+build:
+	GOOS=$(TARGET_OS) GOARCH=$(TARGET_ARCH) go build -o bin/app $(PACKAGE)
+
+test:
+	go test ./...
+
+run:
+	go run $(PACKAGE)
+
+lint: install-lint
+	$(LINTBIN) run
+
+precommit: format build test lint
+	@echo "OK"
+
+format: install-smartimports
+	$(SMARTIMPORTS) -exclude internal/mocks
+
+install-lint: $(LINTBIN)
+
+install-smartimports: $(SMARTIMPORTS)
+
+# Инсталяция бинарных зависимостей
+
+# Интсталируем в локальный bin
+GO_INSTALL := GOBIN=$(PWD)/bin go install
+
+# Зависимости которые нужно устновить
+BIN_DEPS := \
+	github.com/golangci/golangci-lint/cmd/golangci-lint@$(LINTVER);$(LINTBIN) \
+	github.com/pav5000/smartimports/cmd/smartimports@latest;$(SMARTIMPORTS)
+
+define GEN_BIN_RULE
+$$(lastword $$(subst ;, ,$(1))):
+	$(GO_INSTALL) $$(firstword $$(subst ;, ,$(1)))
+	mv bin/$$(notdir $$(firstword $$(subst @, ,$(1))))$(EXE) $$@
+
+BIN_TARGETS += $$(lastword $$(subst ;, ,$(1)))
+endef
+
+$(foreach dep,$(BIN_DEPS),$(eval $(call GEN_BIN_RULE,$(dep))))
+
+.bin-targets:
+	@echo $(BIN_TARGETS)
+
+.bin-deps: $(BIN_TARGETS)
+	@touch $@
+
+.PHONY: clean-bin-deps
+clean-bin-deps:
+	-rm -fr $(BIN_TARGETS) .bin-deps
+
+generate:
+	:
+
+.PHONY: clean
+clean: clean-bin-deps
+	-rm -fr bin
+

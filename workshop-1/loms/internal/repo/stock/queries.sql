@@ -1,18 +1,28 @@
 -- name: GetBySKU :one
 SELECT * FROM stock
-WHERE sku = $1;
+WHERE sku = @sku;
 
 -- name: Reserve :batchone
-UPDATE stock SET reserved = $2
-WHERE sku = $1 AND count-reserved >= $2
-RETURNING sku;
-
--- name: ReserveRemove :batchone
-UPDATE stock SET (count, reserved) = (count-$2, reserved-$2)
-WHERE sku = $1 AND count >= $2 AND reserved >= $2
-RETURNING sku;
+WITH rows AS (
+    UPDATE stock SET available = available - @count, reserved = reserved + @count
+    WHERE sku = @sku AND available >= @count
+    RETURNING sku
+)
+SELECT COUNT(*);
 
 -- name: ReserveCancel :batchone
-UPDATE stock SET reserved = reserved-$2
-WHERE sku = $1 AND reserved >= $2
-RETURNING sku;
+WITH rows AS (
+    UPDATE stock SET available = available + @count, reserved = reserved - @count 
+    WHERE sku = @sku AND reserved >= @count
+    RETURNING sku
+)
+SELECT COUNT(*);
+
+-- name: ReserveRemove :batchone
+WITH rows AS (
+    UPDATE stock SET reserved = reserved - @count
+    WHERE sku = @sku AND reserved >= @count
+    RETURNING sku
+)
+SELECT COUNT(*);
+

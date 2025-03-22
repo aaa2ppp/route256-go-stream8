@@ -24,7 +24,7 @@ import (
 	grpcClient "route256/cart/internal/grpc/client"
 	httpClient "route256/cart/internal/http/client"
 	"route256/cart/internal/http/handler"
-	"route256/cart/internal/memstor"
+	cartRepo "route256/cart/internal/repo/cart"
 	"route256/cart/internal/service"
 	"route256/cart/pkg/http/middleware"
 	"syscall"
@@ -38,16 +38,29 @@ func Run() int {
 
 	setupDefaultLogger(cfg.Logger)
 
+	dbpool, err := openDB(context.Background(), cfg.DB)
+	if err != nil {
+		slog.Error(err.Error())
+		return 1
+	}
+	defer dbpool.Close()
+
+	// cartStor := memstor.NewCart()
+	cartStor := cartRepo.Adapter{Queries: cartRepo.New(dbpool)}
+
 	// lomsClient := httpClient.NewOrder(cfg.HTTPLOMSClient)
 	lomsClient, err := grpcClient.NewOrder(cfg.GRPCLOMSClient)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error(err.Error())
+		return 1
 	}
 
+	productClient := httpClient.NewProduct(cfg.HTTPProductClient)
+
 	cartService := service.NewCart(
-		memstor.NewCart(),
+		cartStor,
 		lomsClient,
-		httpClient.NewProduct(cfg.HTTPProductClient),
+		productClient,
 	)
 
 	mux := http.NewServeMux()
@@ -108,11 +121,160 @@ func pong(w http.ResponseWriter, h *http.Request) {
 	}
 }
 
+// === cart/internal/app/opendb.go ===
+package app
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/url"
+	"reflect"
+	"route256/cart/internal/config"
+	"slices"
+	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func getDBConnectString(cfg *config.DB) string {
+	q := url.Values{}
+	if cfg.SSLMode != "" {
+		q.Set("sslmode", cfg.SSLMode)
+	}
+	u := url.URL{
+		Scheme:   "postgres",
+		Host:     cfg.Addr,
+		User:     url.UserPassword(cfg.User, cfg.Password),
+		Path:     cfg.Name,
+		RawQuery: q.Encode(),
+	}
+	return u.String()
+}
+
+func waitDBUp(ctx context.Context, dbpool *pgxpool.Pool) error {
+	const (
+		initialBackoff = 1 * time.Second
+		maxBackoff     = 10 * time.Second
+	)
+
+	var timer *time.Timer
+	backoff := initialBackoff
+
+	for {
+		// Выполняем проверку подключения
+		err := dbpool.Ping(ctx)
+		if err == nil {
+			return nil
+		}
+		if !isRetryableError(err) {
+			return fmt.Errorf("non-retryable error: %w", err)
+		}
+
+		slog.Debug("connection will be retry", "error", err, "backoff", backoff)
+		if timer == nil {
+			timer = time.NewTimer(backoff)
+		} else {
+			timer.Reset(backoff)
+		}
+
+		// Ждем следующей попытки или завершения контекста
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			// Экспоненциальный рост с ограничением
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
+func openDB(ctx context.Context, cfg *config.DB) (_ *pgxpool.Pool, err error) {
+	dsn := getDBConnectString(cfg)
+
+	dbpool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("create pool: %w", err)
+	}
+
+	defer func() {
+		if err != nil {
+			dbpool.Close()
+		}
+	}()
+
+	if cfg.WaitUpTimeout > 0 {
+		waitCtx, cancel := context.WithTimeout(ctx, cfg.WaitUpTimeout)
+		defer cancel()
+
+		waitErr := waitDBUp(waitCtx, dbpool)
+		if waitErr == nil {
+			return dbpool, nil
+		}
+
+		if !errors.Is(waitErr, context.DeadlineExceeded) || ctx.Err() != nil {
+			return nil, fmt.Errorf("wait for DB failed: %w", waitErr)
+		}
+
+		slog.Debug("wait timeout exceeded, performing final ping")
+	}
+
+	if err := dbpool.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("initial ping failed: %w", err)
+	}
+
+	return dbpool, nil
+}
+
+func isRetryableError(err error) bool {
+	// Если контекст завершен, не повторяем
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+
+	// Сетевые ошибки
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() || errors.Is(netErr, syscall.ECONNREFUSED) {
+			return true
+		}
+		return false
+	}
+
+	// Ошибки PostgreSQL
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		// Список фатальных ошибок из официальной документации:
+		// https://www.postgresql.org/docs/current/errcodes-appendix.html
+		fatalCodes := []string{
+			"28P01", // Invalid password
+			"3D000", // Database does not exist
+			"42501", // Insufficient privilege
+			"42601", // Syntax error
+			"42703", // Undefined column
+			"42P01", // Undefined table
+		}
+		return !slices.Contains(fatalCodes, pgErr.Code)
+	}
+
+	// По умолчанию считаем ошибку повторимой
+	slog.Debug("isRetryableError: unknown error", "error", err, "errorType", reflect.TypeOf(err))
+	return true
+}
+
 // === cart/internal/config/config.go ===
 package config
 
 import (
 	"log/slog"
+	"os"
 	"time"
 )
 
@@ -145,12 +307,22 @@ type GRPCLOMSClient struct {
 	Addr string
 }
 
+type DB struct {
+	Addr          string
+	Name          string
+	User          string
+	Password      string
+	SSLMode       string
+	WaitUpTimeout time.Duration
+}
+
 type Config struct {
 	Logger            *Logger
 	HTTPServer        *HTTPServer
 	HTTPLOMSClient    *HTTPLOMSClient
 	HTTPProductClient *HTTPProductClient
 	GRPCLOMSClient    *GRPCLOMSClient
+	DB                *DB
 }
 
 func Load() (Config, error) {
@@ -178,6 +350,14 @@ func Load() (Config, error) {
 		},
 		GRPCLOMSClient: &GRPCLOMSClient{
 			Addr: "loms:50051",
+		},
+		DB: &DB{
+			Addr:          "db",
+			Name:          "cart",
+			User:          "cart",
+			Password:      os.Getenv("DB_PASSWORD"),
+			SSLMode:       "disable",
+			WaitUpTimeout: 30 * time.Second,
 		},
 	}, nil
 }
@@ -1076,6 +1256,292 @@ type CartItem struct {
 	Count uint16
 }
 
+// === cart/internal/repo/cart/atapter.go ===
+package cart
+
+import (
+	"context"
+	"route256/cart/internal/model"
+	"route256/cart/internal/service"
+)
+
+type Adapter struct {
+	*Queries
+}
+
+func NewQueriesAdapter(q *Queries) Adapter {
+	return Adapter{q}
+}
+
+// Add implements service.CartStorage.
+func (a Adapter) Add(ctx context.Context, req model.AddCartItemRequest) error {
+	n := len(req.Items)
+	user_ids := make([]int64, 0, n)
+	skus := make([]int32, 0, n)
+	counts := make([]int32, 0, n)
+	for _, item := range req.Items {
+		user_ids = append(user_ids, int64(req.UserID))
+		skus = append(skus, int32(item.SKU))
+		counts = append(counts, int32(item.Count))
+	}
+	return a.Queries.AddArrays(ctx, AddArraysParams{
+		Column1: user_ids,
+		Column2: skus,
+		Column3: counts,
+	})
+}
+
+// Clear implements service.CartStorage.
+func (a Adapter) Clear(ctx context.Context, userID model.UserID) error {
+	return a.Queries.Clear(ctx, int64(userID))
+}
+
+// Delete implements service.CartStorage.
+func (a Adapter) Delete(ctx context.Context, req model.DeleteCartItemRequest) error {
+	return a.Queries.Delete(ctx, DeleteParams{
+		UserID: int64(req.UserID),
+		Sku:    int32(req.SKU),
+	})
+}
+
+// List implements service.CartStorage.
+func (a Adapter) List(ctx context.Context, userID model.UserID) ([]model.CartItem, error) {
+	list, err := a.Queries.List(ctx, int64(userID))
+	if err != nil {
+		return nil, err
+	}
+	items := make([]model.CartItem, 0, len(list))
+	for _, item := range list {
+		items = append(items, model.CartItem{
+			SKU:   model.SKU(item.Sku),
+			Count: uint16(item.Count),
+		})
+	}
+	return items, nil
+}
+
+var _ service.CartStorage = Adapter{}
+
+// === cart/internal/repo/cart/batch.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+// source: batch.go
+
+package cart
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+)
+
+var (
+	ErrBatchAlreadyClosed = errors.New("batch already closed")
+)
+
+const addBatch = `-- name: AddBatch :batchexec
+INSERT INTO cart (user_id, sku, count) VALUES ($1, $2, $3)
+ON CONFLICT (user_id, sku) DO UPDATE set count = count + $3
+`
+
+type AddBatchBatchResults struct {
+	br     pgx.BatchResults
+	tot    int
+	closed bool
+}
+
+type AddBatchParams struct {
+	UserID int64 `json:"user_id"`
+	Sku    int32 `json:"sku"`
+	Count  int32 `json:"count"`
+}
+
+func (q *Queries) AddBatch(ctx context.Context, arg []AddBatchParams) *AddBatchBatchResults {
+	batch := &pgx.Batch{}
+	for _, a := range arg {
+		vals := []interface{}{
+			a.UserID,
+			a.Sku,
+			a.Count,
+		}
+		batch.Queue(addBatch, vals...)
+	}
+	br := q.db.SendBatch(ctx, batch)
+	return &AddBatchBatchResults{br, len(arg), false}
+}
+
+func (b *AddBatchBatchResults) Exec(f func(int, error)) {
+	defer b.br.Close()
+	for t := 0; t < b.tot; t++ {
+		if b.closed {
+			if f != nil {
+				f(t, ErrBatchAlreadyClosed)
+			}
+			continue
+		}
+		_, err := b.br.Exec()
+		if f != nil {
+			f(t, err)
+		}
+	}
+}
+
+func (b *AddBatchBatchResults) Close() error {
+	b.closed = true
+	return b.br.Close()
+}
+
+// === cart/internal/repo/cart/db.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package cart
+
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+type DBTX interface {
+	Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...interface{}) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...interface{}) pgx.Row
+	SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
+}
+
+func New(db DBTX) *Queries {
+	return &Queries{db: db}
+}
+
+type Queries struct {
+	db DBTX
+}
+
+func (q *Queries) WithTx(tx pgx.Tx) *Queries {
+	return &Queries{
+		db: tx,
+	}
+}
+
+// === cart/internal/repo/cart/models.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package cart
+
+type Cart struct {
+	UserID int64 `json:"user_id"`
+	Sku    int32 `json:"sku"`
+	Count  int32 `json:"count"`
+}
+
+// === cart/internal/repo/cart/querier.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package cart
+
+import (
+	"context"
+)
+
+type Querier interface {
+	AddArrays(ctx context.Context, arg AddArraysParams) error
+	AddBatch(ctx context.Context, arg []AddBatchParams) *AddBatchBatchResults
+	Clear(ctx context.Context, userID int64) error
+	Delete(ctx context.Context, arg DeleteParams) error
+	List(ctx context.Context, userID int64) ([]Cart, error)
+}
+
+var _ Querier = (*Queries)(nil)
+
+// === cart/internal/repo/cart/queries.sql.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+// source: queries.sql
+
+package cart
+
+import (
+	"context"
+)
+
+const addArrays = `-- name: AddArrays :exec
+INSERT INTO cart (user_id, sku, count)
+SELECT 
+    UNNEST($1::bigint[]) AS user_id,
+    UNNEST($2::int[]   ) AS sku,
+    UNNEST($3::int[]   ) AS count    
+ON CONFLICT (user_id, sku) 
+DO UPDATE SET count = cart.count + EXCLUDED.count
+`
+
+type AddArraysParams struct {
+	Column1 []int64 `json:"column_1"`
+	Column2 []int32 `json:"column_2"`
+	Column3 []int32 `json:"column_3"`
+}
+
+func (q *Queries) AddArrays(ctx context.Context, arg AddArraysParams) error {
+	_, err := q.db.Exec(ctx, addArrays, arg.Column1, arg.Column2, arg.Column3)
+	return err
+}
+
+const clear = `-- name: Clear :exec
+DELETE FROM cart WHERE user_id = $1
+`
+
+func (q *Queries) Clear(ctx context.Context, userID int64) error {
+	_, err := q.db.Exec(ctx, clear, userID)
+	return err
+}
+
+const delete = `-- name: Delete :exec
+DELETE FROM cart WHERE user_id = $1 AND sku = $2
+`
+
+type DeleteParams struct {
+	UserID int64 `json:"user_id"`
+	Sku    int32 `json:"sku"`
+}
+
+func (q *Queries) Delete(ctx context.Context, arg DeleteParams) error {
+	_, err := q.db.Exec(ctx, delete, arg.UserID, arg.Sku)
+	return err
+}
+
+const list = `-- name: List :many
+SELECT user_id, sku, count FROM cart WHERE user_id = $1
+`
+
+func (q *Queries) List(ctx context.Context, userID int64) ([]Cart, error) {
+	rows, err := q.db.Query(ctx, list, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Cart
+	for rows.Next() {
+		var i Cart
+		if err := rows.Scan(&i.UserID, &i.Sku, &i.Count); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 // === cart/internal/service/cart.go ===
 package service
 
@@ -1441,7 +1907,9 @@ import (
 	"route256/loms/internal/config"
 	grpcHandler "route256/loms/internal/grpc/handler"
 	httpHandler "route256/loms/internal/http/handler"
-	"route256/loms/internal/memstor"
+	_ "route256/loms/internal/memstor"
+	orderRepo "route256/loms/internal/repo/order"
+	stockRepo "route256/loms/internal/repo/stock"
 	"route256/loms/internal/service"
 	"route256/loms/pkg/api/order/v1"
 	"route256/loms/pkg/api/stock/v1"
@@ -1460,7 +1928,19 @@ func Run() int {
 
 	setupDefaultLogger(cfg.Logger)
 
-	lomsService := createLOMSService()
+	dbpool, err := openDB(context.TODO(), cfg.DB)
+	if err != nil {
+		slog.Error("can't open database", "error", err)
+		return 1
+	}
+
+	orderStor := orderRepo.Adapter{Queries: orderRepo.New(dbpool)}
+	stockStor := stockRepo.Adapter{Queries: stockRepo.New(dbpool)}
+
+	lomsService := service.NewLOMS(
+		orderStor,
+		stockStor,
+	)
 
 	// Создаем менеджер и добавляем серверы
 	manager := &serverManager{}
@@ -1493,14 +1973,6 @@ func setupDefaultLogger(cfg *config.Logger) {
 		handler = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.Level})
 	}
 	slog.SetDefault(slog.New(handler).With("app", "loms"))
-}
-
-func createLOMSService() *service.LOMS {
-	// TODO: here using memstore for test only
-	return service.NewLOMS(
-		memstor.NewOrder(),
-		memstor.NewRandomStock(productsForTest),
-	)
 }
 
 // server представляет интерфейс для управления сервером.
@@ -1645,6 +2117,154 @@ func (s *grpcServer) Stop(ctx context.Context) {
 	}
 }
 
+// === loms/internal/app/opendb.go ===
+package app
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/url"
+	"reflect"
+	"route256/loms/internal/config"
+	"slices"
+	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func getDBConnectString(cfg *config.DB) string {
+	q := url.Values{}
+	if cfg.SSLMode != "" {
+		q.Set("sslmode", cfg.SSLMode)
+	}
+	u := url.URL{
+		Scheme:   "postgres",
+		Host:     cfg.Addr,
+		User:     url.UserPassword(cfg.User, cfg.Password),
+		Path:     cfg.Name,
+		RawQuery: q.Encode(),
+	}
+	return u.String()
+}
+
+func waitDBUp(ctx context.Context, dbpool *pgxpool.Pool) error {
+	const (
+		initialBackoff = 1 * time.Second
+		maxBackoff     = 10 * time.Second
+	)
+
+	var timer *time.Timer
+	backoff := initialBackoff
+
+	for {
+		// Выполняем проверку подключения
+		err := dbpool.Ping(ctx)
+		if err == nil {
+			return nil
+		}
+		if !isRetryableError(err) {
+			return fmt.Errorf("non-retryable error: %w", err)
+		}
+
+		slog.Debug("connection will be retry", "error", err, "backoff", backoff)
+		if timer == nil {
+			timer = time.NewTimer(backoff)
+		} else {
+			timer.Reset(backoff)
+		}
+
+		// Ждем следующей попытки или завершения контекста
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			// Экспоненциальный рост с ограничением
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
+func openDB(ctx context.Context, cfg *config.DB) (_ *pgxpool.Pool, err error) {
+	dsn := getDBConnectString(cfg)
+
+	dbpool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("create pool: %w", err)
+	}
+
+	defer func() {
+		if err != nil {
+			dbpool.Close()
+		}
+	}()
+
+	if cfg.WaitUpTimeout > 0 {
+		waitCtx, cancel := context.WithTimeout(ctx, cfg.WaitUpTimeout)
+		defer cancel()
+
+		waitErr := waitDBUp(waitCtx, dbpool)
+		if waitErr == nil {
+			return dbpool, nil
+		}
+
+		if !errors.Is(waitErr, context.DeadlineExceeded) || ctx.Err() != nil {
+			return nil, fmt.Errorf("wait for DB failed: %w", waitErr)
+		}
+
+		slog.Debug("wait timeout exceeded, performing final ping")
+	}
+
+	if err := dbpool.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("initial ping failed: %w", err)
+	}
+
+	return dbpool, nil
+}
+
+func isRetryableError(err error) bool {
+	// Если контекст завершен, не повторяем
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+
+	// Сетевые ошибки
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() || errors.Is(netErr, syscall.ECONNREFUSED) {
+			return true
+		}
+		return false
+	}
+
+	// Ошибки PostgreSQL
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		// Список фатальных ошибок из официальной документации:
+		// https://www.postgresql.org/docs/current/errcodes-appendix.html
+		fatalCodes := []string{
+			"28P01", // Invalid password
+			"3D000", // Database does not exist
+			"42501", // Insufficient privilege
+			"42601", // Syntax error
+			"42703", // Undefined column
+			"42P01", // Undefined table
+		}
+		return !slices.Contains(fatalCodes, pgErr.Code)
+	}
+
+	// По умолчанию считаем ошибку повторимой
+	slog.Debug("isRetryableError: unknown error", "error", err, "errorType", reflect.TypeOf(err))
+	return true
+}
+
 // === loms/internal/app/pong.go ===
 package app
 
@@ -1666,11 +2286,14 @@ var productsForTest = []model.SKU{
 	4465995,
 }
 
+var _ = productsForTest
+
 // === loms/internal/config/config.go ===
 package config
 
 import (
 	"log/slog"
+	"os"
 	"time"
 )
 
@@ -1689,11 +2312,21 @@ type GRPCServer struct {
 	Addr string
 }
 
+type DB struct {
+	Addr          string
+	Name          string
+	User          string
+	Password      string
+	SSLMode       string
+	WaitUpTimeout time.Duration
+}
+
 type Config struct {
 	ShutdownTimeout time.Duration
 	Logger          *Logger
 	HTTPServer      *HTTPServer
 	GRPCServer      *GRPCServer
+	DB              *DB
 }
 
 func Load() (Config, error) {
@@ -1710,6 +2343,14 @@ func Load() (Config, error) {
 		},
 		GRPCServer: &GRPCServer{
 			Addr: ":50051",
+		},
+		DB: &DB{
+			Addr:          "db",
+			Name:          "loms",
+			User:          "loms",
+			Password:      os.Getenv("DB_PASSWORD"),
+			SSLMode:       "disable",
+			WaitUpTimeout: 30 * time.Second,
 		},
 	}, nil
 }
@@ -1751,7 +2392,7 @@ import (
 )
 
 type LomsService interface {
-	CreateOrder(ctx context.Context, req model.CreateOrderRequest) (resp model.CreateOrderResponse, err error)
+	CreateOrder(ctx context.Context, req model.CreateOrderRequest) (orderID model.OrderID, err error)
 	GetOrderInfo(ctx context.Context, orderID model.OrderID) (resp model.Order, err error)
 	PayOrder(ctx context.Context, orderID model.OrderID) error
 	CancelOrder(ctx context.Context, orderID model.OrderID) error
@@ -1775,14 +2416,14 @@ func (o Order) Create(ctx context.Context, req *order.CreateRequest) (*order.Cre
 	for _, item := range req.Items {
 		mreq.Items = append(mreq.Items, model.OrderItem{
 			SKU:   model.SKU(item.Sku),
-			Count: uint16(item.Count),
+			Count: int(item.Count),
 		})
 	}
-	mresp, err := o.service.CreateOrder(ctx, mreq)
+	orderID, err := o.service.CreateOrder(ctx, mreq)
 	if err != nil {
 		return nil, mapError(ctx, err)
 	}
-	return &order.CreateResponse{OrderID: int64(mresp.OrderID)}, nil
+	return &order.CreateResponse{OrderID: int64(orderID)}, nil
 }
 
 func (o Order) GetInfo(ctx context.Context, req *order.GetInfoRequest) (*order.GetInfoResponse, error) {
@@ -2016,7 +2657,7 @@ import (
 
 type orderItem struct {
 	SKU   model.SKU `json:"sku"`
-	Count uint16    `json:"count"`
+	Count int       `json:"count"`
 }
 
 type createOrderRequest struct {
@@ -2047,7 +2688,7 @@ type createOreserResponce struct {
 	OrderID model.OrderID `json:"orderID"`
 }
 
-func CreateOrder(crateFunc func(ctx context.Context, req model.CreateOrderRequest) (resp model.CreateOrderResponse, err error)) http.HandlerFunc {
+func CreateOrder(crateFunc func(ctx context.Context, req model.CreateOrderRequest) (orderID model.OrderID, err error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		x := newHelper(w, r, "CreateOrder")
 
@@ -2067,13 +2708,13 @@ func CreateOrder(crateFunc func(ctx context.Context, req model.CreateOrderReques
 			})
 		}
 
-		mresp, err := crateFunc(x.ctx(), mreq)
+		orderID, err := crateFunc(x.ctx(), mreq)
 		if err != nil {
 			x.writeError(err)
 			return
 		}
 
-		x.writeResponse(200, createOreserResponce{mresp.OrderID}) // or 201 ?
+		x.writeResponse(200, createOreserResponce{orderID}) // or 201 ?
 	}
 }
 
@@ -2230,7 +2871,7 @@ func (o *Order) newOrderID() model.OrderID {
 }
 
 // Create implements service.OrderStorage.
-func (o *Order) Create(_ context.Context, req model.CreateOrderRequest) (model.CreateOrderResponse, error) {
+func (o *Order) Create(_ context.Context, req model.CreateOrderRequest) (model.OrderID, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
@@ -2243,10 +2884,7 @@ func (o *Order) Create(_ context.Context, req model.CreateOrderRequest) (model.C
 		Items:  slices.Clone(req.Items),
 	}
 
-	return model.CreateOrderResponse{
-		OrderID: orderID,
-		Status:  status,
-	}, nil
+	return orderID, nil
 }
 
 // GetByID implements service.OrderStorage.
@@ -2292,11 +2930,11 @@ import (
 )
 
 type stockItem struct {
-	count    uint64
-	reserved uint64
+	count    int64
+	reserved int64
 }
 
-func (si stockItem) available() uint64 {
+func (si stockItem) available() int64 {
 	return si.count - si.reserved
 }
 
@@ -2318,7 +2956,7 @@ func NewRandomStock(producs []model.SKU) *Stock {
 	for _, sku := range producs {
 		items = append(items, StockItem{
 			SKU:   sku,
-			Count: rand.Uint64N(maxProductCount),
+			Count: rand.Int64N(maxProductCount),
 		})
 	}
 
@@ -2329,7 +2967,7 @@ func NewRandomStock(producs []model.SKU) *Stock {
 
 type StockItem struct {
 	SKU   model.SKU
-	Count uint64
+	Count int64
 }
 
 func (s *Stock) Init(items []StockItem) {
@@ -2342,16 +2980,20 @@ func (s *Stock) Init(items []StockItem) {
 	}
 }
 
-// GetInfo implements service.StockStorage.
-func (s *Stock) GetInfo(_ context.Context, sku model.SKU) (count uint64, err error) {
+// GetBySKU implements service.StockStorage.
+func (s *Stock) GetBySKU(_ context.Context, sku model.SKU) (_ model.Stock, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	item, exists := s.items[sku]
 	if !exists {
-		return 0, model.ErrNotFound
+		return model.Stock{}, model.ErrNotFound
 	}
-	return item.available(), nil
+	return model.Stock{
+		SKU:      sku,
+		Count:    int64(item.count),
+		Reserved: int64(item.reserved),
+	}, nil
 }
 
 // Reserve implements service.StockStorage.
@@ -2365,10 +3007,11 @@ func (s *Stock) Reserve(_ context.Context, orderItems []model.OrderItem) error {
 	}
 
 	for i := range stockItems {
-		if stockItems[i].available() < uint64(orderItems[i].Count) {
+		n := int64(orderItems[i].Count)
+		if stockItems[i].available() < n {
 			return fmt.Errorf("insufficient available SKU=%v", orderItems[i].SKU)
 		}
-		stockItems[i].reserved += uint64(orderItems[i].Count)
+		stockItems[i].reserved += n
 	}
 
 	for i := range stockItems {
@@ -2389,10 +3032,11 @@ func (s *Stock) ReserveCancel(_ context.Context, orderItems []model.OrderItem) e
 	}
 
 	for i := range stockItems {
-		if stockItems[i].reserved < uint64(orderItems[i].Count) {
+		n := int64(orderItems[i].Count)
+		if stockItems[i].reserved < n {
 			return fmt.Errorf("insufficient reserved SKU=%v", orderItems[i].SKU)
 		}
-		stockItems[i].reserved -= uint64(orderItems[i].Count)
+		stockItems[i].reserved -= n
 	}
 
 	for i := range stockItems {
@@ -2413,10 +3057,13 @@ func (s *Stock) ReserveRemove(_ context.Context, orderItems []model.OrderItem) e
 	}
 
 	for i := range stockItems {
-		if stockItems[i].reserved < uint64(orderItems[i].Count) {
+		n := int64(orderItems[i].Count)
+		if stockItems[i].reserved < n {
+			return fmt.Errorf("insufficient count SKU=%v", orderItems[i].SKU)
+		}
+		if stockItems[i].reserved < n {
 			return fmt.Errorf("insufficient reserved SKU=%v", orderItems[i].SKU)
 		}
-		n := uint64(orderItems[i].Count)
 		stockItems[i].count -= n
 		stockItems[i].reserved -= n
 	}
@@ -2438,12 +3085,10 @@ type CreateOrderRequest struct {
 	Items  []OrderItem
 }
 
-type CreateOrderResponse struct {
+type SetOrderStatusRequest struct {
 	OrderID OrderID
 	Status  OrderStatus
 }
-
-type SetOrderStatusRequest = CreateOrderResponse
 
 // === loms/internal/model/error.go ===
 package model
@@ -2460,20 +3105,27 @@ var (
 package model
 
 type (
-	UserID  int64
-	SKU     int32
 	OrderID int64
+	UserID  int64
+	SKU     int64
 )
 
-type OrderItem struct {
-	SKU   SKU
-	Count uint16
+type Order struct {
+	OrderID
+	UserID
+	Status OrderStatus
+	Items  []OrderItem
 }
 
-type Order struct {
-	Status OrderStatus
-	UserID
-	Items []OrderItem
+type OrderItem struct {
+	SKU
+	Count int
+}
+
+type Stock struct {
+	SKU
+	Count    int64
+	Reserved int64
 }
 
 // === loms/internal/model/order_status.go ===
@@ -2554,6 +3206,637 @@ func (os *OrderStatus) UnmarshalJSON(b []byte) error {
 var _ json.Marshaler = OrderStatus(0)
 var _ json.Unmarshaler = new(OrderStatus)
 
+// === loms/internal/repo/order/adapter.go ===
+package order
+
+import (
+	"context"
+	"route256/loms/internal/model"
+	"route256/loms/internal/service"
+)
+
+type Adapter struct {
+	*Queries
+}
+
+// Create implements storage.
+func (a Adapter) Create(ctx context.Context, req model.CreateOrderRequest) (model.OrderID, error) {
+	orderID, err := a.Queries.Create(ctx, int64(req.UserID))
+	if err != nil {
+		return 0, err
+	}
+
+	n := len(req.Items)
+	orders := make([]int64, 0, n)
+	skus := make([]int64, 0, n)
+	counts := make([]int32, 0, n)
+	for _, item := range req.Items {
+		orders = append(orders, orderID)
+		skus = append(skus, int64(item.SKU))
+		counts = append(counts, int32(item.Count))
+	}
+
+	if err := a.Queries.AddItems(ctx, AddItemsParams{
+		Column1: orders,
+		Column2: skus,
+		Column3: counts,
+	}); err != nil {
+		return 0, err
+	}
+
+	return model.OrderID(orderID), nil
+}
+
+// GetByID implements storage.
+func (a Adapter) GetByID(ctx context.Context, orderID model.OrderID) (model.Order, error) {
+	qresp, err := a.Queries.GetByID(ctx, int64(orderID))
+	if err != nil {
+		return model.Order{}, err
+	}
+	if len(qresp) == 0 {
+		return model.Order{}, model.ErrNotFound
+	}
+	status, err := model.ParseOrderStatus(string(qresp[0].Status))
+	if err != nil {
+		return model.Order{}, err
+	}
+
+	resp := model.Order{
+		UserID: model.UserID(qresp[0].UserID),
+		Status: status,
+		Items:  make([]model.OrderItem, 0, len(qresp)),
+	}
+
+	for _, item := range qresp {
+		resp.Items = append(resp.Items, model.OrderItem{
+			SKU:   model.SKU(item.Sku),
+			Count: int(item.Count),
+		})
+	}
+
+	return resp, nil
+}
+
+// SetStatus implements storage.
+func (a Adapter) SetStatus(ctx context.Context, req model.SetOrderStatusRequest) error {
+	return a.Queries.SetStatus(ctx, SetStatusParams{
+		OrderID: int64(req.OrderID),
+		Status:  OrderStatus(req.Status.String()),
+	})
+}
+
+var _ service.OrderStorage = Adapter{}
+
+type StockAdapter struct {
+	*Queries
+}
+
+// === loms/internal/repo/order/db.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package order
+
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+type DBTX interface {
+	Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...interface{}) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...interface{}) pgx.Row
+}
+
+func New(db DBTX) *Queries {
+	return &Queries{db: db}
+}
+
+type Queries struct {
+	db DBTX
+}
+
+func (q *Queries) WithTx(tx pgx.Tx) *Queries {
+	return &Queries{
+		db: tx,
+	}
+}
+
+// === loms/internal/repo/order/models.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package order
+
+import (
+	"database/sql/driver"
+	"fmt"
+)
+
+type OrderStatus string
+
+const (
+	OrderStatusNew             OrderStatus = "new"
+	OrderStatusAwaitingpayment OrderStatus = "awaiting payment"
+	OrderStatusFailed          OrderStatus = "failed"
+	OrderStatusPayed           OrderStatus = "payed"
+	OrderStatusCancelled       OrderStatus = "cancelled"
+)
+
+func (e *OrderStatus) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = OrderStatus(s)
+	case string:
+		*e = OrderStatus(s)
+	default:
+		return fmt.Errorf("unsupported scan type for OrderStatus: %T", src)
+	}
+	return nil
+}
+
+type NullOrderStatus struct {
+	OrderStatus OrderStatus `json:"order_status"`
+	Valid       bool        `json:"valid"` // Valid is true if OrderStatus is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullOrderStatus) Scan(value interface{}) error {
+	if value == nil {
+		ns.OrderStatus, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.OrderStatus.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullOrderStatus) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.OrderStatus), nil
+}
+
+// === loms/internal/repo/order/querier.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package order
+
+import (
+	"context"
+)
+
+type Querier interface {
+	AddItems(ctx context.Context, arg AddItemsParams) error
+	Create(ctx context.Context, userID int64) (int64, error)
+	GetByID(ctx context.Context, orderID int64) ([]GetByIDRow, error)
+	SetStatus(ctx context.Context, arg SetStatusParams) error
+}
+
+var _ Querier = (*Queries)(nil)
+
+// === loms/internal/repo/order/queries.sql.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+// source: queries.sql
+
+package order
+
+import (
+	"context"
+)
+
+const addItems = `-- name: AddItems :exec
+INSERT INTO order_items (order_id, sku, count)
+SELECT UNNEST($1::bigint[]) AS order_id, UNNEST($2::bigint[]) AS sku, UNNEST($3::int[]) AS count
+`
+
+type AddItemsParams struct {
+	Column1 []int64 `json:"column_1"`
+	Column2 []int64 `json:"column_2"`
+	Column3 []int32 `json:"column_3"`
+}
+
+func (q *Queries) AddItems(ctx context.Context, arg AddItemsParams) error {
+	_, err := q.db.Exec(ctx, addItems, arg.Column1, arg.Column2, arg.Column3)
+	return err
+}
+
+const create = `-- name: Create :one
+INSERT INTO "order" (user_id, status) VALUES ($1, 'new')
+RETURNING order_id
+`
+
+func (q *Queries) Create(ctx context.Context, userID int64) (int64, error) {
+	row := q.db.QueryRow(ctx, create, userID)
+	var order_id int64
+	err := row.Scan(&order_id)
+	return order_id, err
+}
+
+const getByID = `-- name: GetByID :many
+SELECT o.order_id, o.user_id, o.status, oi.sku, oi.count
+FROM "order" AS o JOIN order_items AS oi USING(order_id)
+WHERE o.order_id = $1
+`
+
+type GetByIDRow struct {
+	OrderID int64       `json:"order_id"`
+	UserID  int64       `json:"user_id"`
+	Status  OrderStatus `json:"status"`
+	Sku     int64       `json:"sku"`
+	Count   int32       `json:"count"`
+}
+
+func (q *Queries) GetByID(ctx context.Context, orderID int64) ([]GetByIDRow, error) {
+	rows, err := q.db.Query(ctx, getByID, orderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetByIDRow
+	for rows.Next() {
+		var i GetByIDRow
+		if err := rows.Scan(
+			&i.OrderID,
+			&i.UserID,
+			&i.Status,
+			&i.Sku,
+			&i.Count,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const setStatus = `-- name: SetStatus :exec
+UPDATE "order" set status = $2
+WHERE order_id = $1
+`
+
+type SetStatusParams struct {
+	OrderID int64       `json:"order_id"`
+	Status  OrderStatus `json:"status"`
+}
+
+func (q *Queries) SetStatus(ctx context.Context, arg SetStatusParams) error {
+	_, err := q.db.Exec(ctx, setStatus, arg.OrderID, arg.Status)
+	return err
+}
+
+// === loms/internal/repo/stock/adapter.go ===
+package stock
+
+import (
+	"context"
+	"route256/loms/internal/model"
+	"route256/loms/internal/service"
+)
+
+type Adapter struct {
+	*Queries
+}
+
+// GetBySKU implements storage.
+func (a Adapter) GetBySKU(ctx context.Context, sku model.SKU) (_ model.Stock, err error) {
+	qresp, err := a.Queries.GetBySKU(ctx, int64(sku))
+	if err != nil {
+		return model.Stock{}, err
+	}
+	return model.Stock{
+		SKU:      sku,
+		Count:    qresp.Count,
+		Reserved: qresp.Reserved,
+	}, nil
+}
+
+// Reserve implements storage.
+func (a Adapter) Reserve(ctx context.Context, items []model.OrderItem) (err error) {
+	qitems := make([]ReserveParams, 0, len(items))
+	for _, item := range items {
+		qitems = append(qitems, ReserveParams{
+			Sku:      int64(item.SKU),
+			Reserved: int64(item.Count)},
+		)
+	}
+	b := a.Queries.Reserve(ctx, qitems)
+	b.QueryRow(nil) // TODO: check error for each SKU
+	return b.Close()
+}
+
+// ReserveCancel implements storage.
+func (a Adapter) ReserveCancel(ctx context.Context, items []model.OrderItem) error {
+	qitems := make([]ReserveCancelParams, 0, len(items))
+	for _, item := range items {
+		qitems = append(qitems, ReserveCancelParams{
+			Sku:      int64(item.SKU),
+			Reserved: int64(item.Count)},
+		)
+	}
+	b := a.Queries.ReserveCancel(ctx, qitems)
+	b.QueryRow(nil) // TODO: check error for each SKU
+	return b.Close()
+}
+
+// ReserveRemove implements storage.
+func (a Adapter) ReserveRemove(ctx context.Context, items []model.OrderItem) error {
+	qitems := make([]ReserveRemoveParams, 0, len(items))
+	for _, item := range items {
+		qitems = append(qitems, ReserveRemoveParams{
+			Sku:   int64(item.SKU),
+			Count: int64(item.Count)},
+		)
+	}
+	b := a.Queries.ReserveRemove(ctx, qitems)
+	b.QueryRow(nil) // TODO: check error for each SKU
+	return b.Close()
+}
+
+var _ service.StockStorage = Adapter{}
+
+// === loms/internal/repo/stock/batch.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+// source: batch.go
+
+package stock
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+)
+
+var (
+	ErrBatchAlreadyClosed = errors.New("batch already closed")
+)
+
+const reserve = `-- name: Reserve :batchone
+UPDATE stock SET reserved = $2
+WHERE sku = $1 AND count-reserved >= $2
+RETURNING sku
+`
+
+type ReserveBatchResults struct {
+	br     pgx.BatchResults
+	tot    int
+	closed bool
+}
+
+type ReserveParams struct {
+	Sku      int64 `json:"sku"`
+	Reserved int64 `json:"reserved"`
+}
+
+func (q *Queries) Reserve(ctx context.Context, arg []ReserveParams) *ReserveBatchResults {
+	batch := &pgx.Batch{}
+	for _, a := range arg {
+		vals := []interface{}{
+			a.Sku,
+			a.Reserved,
+		}
+		batch.Queue(reserve, vals...)
+	}
+	br := q.db.SendBatch(ctx, batch)
+	return &ReserveBatchResults{br, len(arg), false}
+}
+
+func (b *ReserveBatchResults) QueryRow(f func(int, int64, error)) {
+	defer b.br.Close()
+	for t := 0; t < b.tot; t++ {
+		var sku int64
+		if b.closed {
+			if f != nil {
+				f(t, sku, ErrBatchAlreadyClosed)
+			}
+			continue
+		}
+		row := b.br.QueryRow()
+		err := row.Scan(&sku)
+		if f != nil {
+			f(t, sku, err)
+		}
+	}
+}
+
+func (b *ReserveBatchResults) Close() error {
+	b.closed = true
+	return b.br.Close()
+}
+
+const reserveCancel = `-- name: ReserveCancel :batchone
+UPDATE stock SET reserved = reserved-$2
+WHERE sku = $1 AND reserved >= $2
+RETURNING sku
+`
+
+type ReserveCancelBatchResults struct {
+	br     pgx.BatchResults
+	tot    int
+	closed bool
+}
+
+type ReserveCancelParams struct {
+	Sku      int64 `json:"sku"`
+	Reserved int64 `json:"reserved"`
+}
+
+func (q *Queries) ReserveCancel(ctx context.Context, arg []ReserveCancelParams) *ReserveCancelBatchResults {
+	batch := &pgx.Batch{}
+	for _, a := range arg {
+		vals := []interface{}{
+			a.Sku,
+			a.Reserved,
+		}
+		batch.Queue(reserveCancel, vals...)
+	}
+	br := q.db.SendBatch(ctx, batch)
+	return &ReserveCancelBatchResults{br, len(arg), false}
+}
+
+func (b *ReserveCancelBatchResults) QueryRow(f func(int, int64, error)) {
+	defer b.br.Close()
+	for t := 0; t < b.tot; t++ {
+		var sku int64
+		if b.closed {
+			if f != nil {
+				f(t, sku, ErrBatchAlreadyClosed)
+			}
+			continue
+		}
+		row := b.br.QueryRow()
+		err := row.Scan(&sku)
+		if f != nil {
+			f(t, sku, err)
+		}
+	}
+}
+
+func (b *ReserveCancelBatchResults) Close() error {
+	b.closed = true
+	return b.br.Close()
+}
+
+const reserveRemove = `-- name: ReserveRemove :batchone
+UPDATE stock SET (count, reserved) = (count-$2, reserved-$2)
+WHERE sku = $1 AND count >= $2 AND reserved >= $2
+RETURNING sku
+`
+
+type ReserveRemoveBatchResults struct {
+	br     pgx.BatchResults
+	tot    int
+	closed bool
+}
+
+type ReserveRemoveParams struct {
+	Sku   int64 `json:"sku"`
+	Count int64 `json:"count"`
+}
+
+func (q *Queries) ReserveRemove(ctx context.Context, arg []ReserveRemoveParams) *ReserveRemoveBatchResults {
+	batch := &pgx.Batch{}
+	for _, a := range arg {
+		vals := []interface{}{
+			a.Sku,
+			a.Count,
+		}
+		batch.Queue(reserveRemove, vals...)
+	}
+	br := q.db.SendBatch(ctx, batch)
+	return &ReserveRemoveBatchResults{br, len(arg), false}
+}
+
+func (b *ReserveRemoveBatchResults) QueryRow(f func(int, int64, error)) {
+	defer b.br.Close()
+	for t := 0; t < b.tot; t++ {
+		var sku int64
+		if b.closed {
+			if f != nil {
+				f(t, sku, ErrBatchAlreadyClosed)
+			}
+			continue
+		}
+		row := b.br.QueryRow()
+		err := row.Scan(&sku)
+		if f != nil {
+			f(t, sku, err)
+		}
+	}
+}
+
+func (b *ReserveRemoveBatchResults) Close() error {
+	b.closed = true
+	return b.br.Close()
+}
+
+// === loms/internal/repo/stock/db.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package stock
+
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+type DBTX interface {
+	Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...interface{}) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...interface{}) pgx.Row
+	SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
+}
+
+func New(db DBTX) *Queries {
+	return &Queries{db: db}
+}
+
+type Queries struct {
+	db DBTX
+}
+
+func (q *Queries) WithTx(tx pgx.Tx) *Queries {
+	return &Queries{
+		db: tx,
+	}
+}
+
+// === loms/internal/repo/stock/models.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package stock
+
+type Stock struct {
+	Sku      int64 `json:"sku"`
+	Count    int64 `json:"count"`
+	Reserved int64 `json:"reserved"`
+}
+
+// === loms/internal/repo/stock/querier.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package stock
+
+import (
+	"context"
+)
+
+type Querier interface {
+	GetBySKU(ctx context.Context, sku int64) (Stock, error)
+	Reserve(ctx context.Context, arg []ReserveParams) *ReserveBatchResults
+	ReserveCancel(ctx context.Context, arg []ReserveCancelParams) *ReserveCancelBatchResults
+	ReserveRemove(ctx context.Context, arg []ReserveRemoveParams) *ReserveRemoveBatchResults
+}
+
+var _ Querier = (*Queries)(nil)
+
+// === loms/internal/repo/stock/queries.sql.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+// source: queries.sql
+
+package stock
+
+import (
+	"context"
+)
+
+const getBySKU = `-- name: GetBySKU :one
+SELECT sku, count, reserved FROM stock
+WHERE sku = $1
+`
+
+func (q *Queries) GetBySKU(ctx context.Context, sku int64) (Stock, error) {
+	row := q.db.QueryRow(ctx, getBySKU, sku)
+	var i Stock
+	err := row.Scan(&i.Sku, &i.Count, &i.Reserved)
+	return i, err
+}
+
 // === loms/internal/service/logger.go ===
 package service
 
@@ -2577,7 +3860,7 @@ import (
 )
 
 type OrderStorage interface {
-	Create(ctx context.Context, req model.CreateOrderRequest) (model.CreateOrderResponse, error)
+	Create(ctx context.Context, req model.CreateOrderRequest) (model.OrderID, error)
 	SetStatus(ctx context.Context, req model.SetOrderStatusRequest) error
 	GetByID(ctx context.Context, orderID model.OrderID) (model.Order, error)
 }
@@ -2586,7 +3869,7 @@ type StockStorage interface {
 	Reserve(ctx context.Context, items []model.OrderItem) error
 	ReserveRemove(ctx context.Context, items []model.OrderItem) error
 	ReserveCancel(ctx context.Context, items []model.OrderItem) error
-	GetInfo(ctx context.Context, sku model.SKU) (count uint64, err error)
+	GetBySKU(ctx context.Context, sku model.SKU) (stock model.Stock, err error)
 }
 
 type LOMS struct {
@@ -2601,12 +3884,12 @@ func NewLOMS(order OrderStorage, stock StockStorage) *LOMS {
 	}
 }
 
-func (p *LOMS) CreateOrder(ctx context.Context, req model.CreateOrderRequest) (resp model.CreateOrderResponse, err error) {
+func (p *LOMS) CreateOrder(ctx context.Context, req model.CreateOrderRequest) (orderID model.OrderID, err error) {
 	log := getLogger(ctx, "LOMS.CreateOrder")
 
-	resp, err = p.order.Create(ctx, req)
+	orderID, err = p.order.Create(ctx, req)
 	if err != nil {
-		return resp, err
+		return orderID, err
 	}
 
 	var status model.OrderStatus
@@ -2617,19 +3900,17 @@ func (p *LOMS) CreateOrder(ctx context.Context, req model.CreateOrderRequest) (r
 	}
 
 	if err := p.order.SetStatus(ctx, model.SetOrderStatusRequest{
-		OrderID: resp.OrderID,
+		OrderID: orderID,
 		Status:  status,
 	}); err != nil {
 		log.Error("can't set order status", "error", err)
-		return resp, model.ErrInternalError
+		return 0, model.ErrInternalError
 	}
 
-	resp.Status = status
-
-	if resp.Status == model.OrderStatusAwaitingPayment {
-		return resp, nil
+	if status == model.OrderStatusAwaitingPayment {
+		return orderID, nil
 	} else {
-		return resp, model.ErrPreconditionFailed
+		return 0, model.ErrPreconditionFailed
 	}
 }
 
@@ -2696,7 +3977,11 @@ func (p *LOMS) CancelOrder(ctx context.Context, orderID model.OrderID) error {
 }
 
 func (p *LOMS) GetStockInfo(ctx context.Context, sku model.SKU) (count uint64, err error) {
-	return p.stock.GetInfo(ctx, sku)
+	stock, err := p.stock.GetBySKU(ctx, sku)
+	if err != nil {
+		return 0, err
+	}
+	return uint64(stock.Count - stock.Reserved), nil
 }
 
 // === notifications/cmd/app/main.go ===

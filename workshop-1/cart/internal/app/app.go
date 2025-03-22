@@ -17,6 +17,13 @@ import (
 	"syscall"
 )
 
+// чтобы именованые пакеты не "убегали"
+var (
+	_ = (*grpcClient.Product)(nil)
+	_ = (*httpClient.Product)(nil)
+	_ = (*cartRepo.Adapter)(nil)
+)
+
 func Run() int {
 	cfg, err := config.Load()
 	if err != nil {
@@ -33,7 +40,7 @@ func Run() int {
 	defer dbpool.Close()
 
 	// cartStor := memstor.NewCart()
-	cartStor := cartRepo.Adapter{Queries: cartRepo.New(dbpool)}
+	cartStor := cartRepo.New(dbpool)
 
 	// lomsClient := httpClient.NewOrder(cfg.HTTPLOMSClient)
 	lomsClient, err := grpcClient.NewOrder(cfg.GRPCLOMSClient)
@@ -42,7 +49,12 @@ func Run() int {
 		return 1
 	}
 
-	productClient := httpClient.NewProduct(cfg.HTTPProductClient)
+	// productClient := httpClient.NewProduct(cfg.HTTPProductClient)
+	productClient, err := grpcClient.NewProduct(cfg.GRPCProductClient)
+	if err != nil {
+		slog.Error(err.Error())
+		return 1
+	}
 
 	cartService := service.NewCart(
 		cartStor,
@@ -50,13 +62,16 @@ func Run() int {
 		productClient,
 	)
 
+	cartMux := http.NewServeMux()
+	cartMux.Handle("POST /cart/item/add", handler.CartAddItem(cartService.Add))
+	cartMux.Handle("POST /cart/item/delete", handler.CartDeleteItem(cartService.Delete))
+	cartMux.Handle("POST /cart/list", handler.CartList(cartService.List))
+	cartMux.Handle("POST /cart/clear", handler.CartClear(cartService.Clear))
+	cartMux.Handle("POST /cart/checkout", handler.CartCheckout(cartService.Checkout))
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /ping", pong)
-	mux.Handle("POST /cart/item/add", handler.CartAddItem(cartService.Add))
-	mux.Handle("POST /cart/item/delete", handler.CartDeleteItem(cartService.Delete))
-	mux.Handle("POST /cart/list", handler.CartList(cartService.List))
-	mux.Handle("POST /cart/clear", handler.CartClear(cartService.Clear))
-	mux.Handle("POST /cart/checkout", handler.CartCheckout(cartService.Checkout))
+	mux.HandleFunc("/ping", pong)
+	mux.Handle("/cart/", middleware.Auth(cartMux))
 
 	httpServer := &http.Server{
 		Addr:         cfg.HTTPServer.Addr,

@@ -3,60 +3,29 @@ package memstor
 import (
 	"context"
 	"fmt"
-	"math/rand/v2"
 	"route256/loms/internal/model"
 	"route256/loms/internal/service"
 	"sync"
 )
 
-type stockItem struct {
-	count    int64
-	reserved int64
-}
-
-func (si stockItem) available() int64 {
-	return si.count - si.reserved
-}
-
 type Stock struct {
 	mu    sync.RWMutex
-	items map[model.SKU]stockItem
+	items map[model.SKU]model.Stock
 }
 
 func NewStock() *Stock {
 	return &Stock{
-		items: map[model.SKU]stockItem{},
+		items: map[model.SKU]model.Stock{},
 	}
 }
 
-func NewRandomStock(producs []model.SKU) *Stock {
-	const maxProductCount = 10
-
-	items := make([]StockItem, 0, len(producs))
-	for _, sku := range producs {
-		items = append(items, StockItem{
-			SKU:   sku,
-			Count: rand.Int64N(maxProductCount),
-		})
-	}
-
-	stock := NewStock()
-	stock.Init(items)
-	return stock
-}
-
-type StockItem struct {
-	SKU   model.SKU
-	Count int64
-}
-
-func (s *Stock) Init(items []StockItem) {
+func (s *Stock) Init(items []model.Stock) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.items = make(map[model.SKU]stockItem)
-	for _, item := range items {
-		s.items[item.SKU] = stockItem{count: item.Count}
+	s.items = make(map[model.SKU]model.Stock, len(items))
+	for i := range items {
+		s.items[items[i].SKU] = items[i]
 	}
 }
 
@@ -69,11 +38,7 @@ func (s *Stock) GetBySKU(_ context.Context, sku model.SKU) (_ model.Stock, err e
 	if !exists {
 		return model.Stock{}, model.ErrNotFound
 	}
-	return model.Stock{
-		SKU:      sku,
-		Count:    int64(item.count),
-		Reserved: int64(item.reserved),
-	}, nil
+	return item, nil
 }
 
 // Reserve implements service.StockStorage.
@@ -81,17 +46,18 @@ func (s *Stock) Reserve(_ context.Context, orderItems []model.OrderItem) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	stockItems := make([]stockItem, 0, len(orderItems))
+	stockItems := make([]model.Stock, 0, len(orderItems))
 	for _, orderItem := range orderItems {
 		stockItems = append(stockItems, s.items[orderItem.SKU])
 	}
 
 	for i := range stockItems {
-		n := int64(orderItems[i].Count)
-		if stockItems[i].available() < n {
+		count := uint64(orderItems[i].Count)
+		if stockItems[i].Available < count {
 			return fmt.Errorf("insufficient available SKU=%v", orderItems[i].SKU)
 		}
-		stockItems[i].reserved += n
+		stockItems[i].Available -= count
+		stockItems[i].Reserved += count
 	}
 
 	for i := range stockItems {
@@ -106,17 +72,18 @@ func (s *Stock) ReserveCancel(_ context.Context, orderItems []model.OrderItem) e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	stockItems := make([]stockItem, 0, len(orderItems))
+	stockItems := make([]model.Stock, 0, len(orderItems))
 	for _, orderItem := range orderItems {
 		stockItems = append(stockItems, s.items[orderItem.SKU])
 	}
 
 	for i := range stockItems {
-		n := int64(orderItems[i].Count)
-		if stockItems[i].reserved < n {
+		count := uint64(orderItems[i].Count)
+		if stockItems[i].Reserved < count {
 			return fmt.Errorf("insufficient reserved SKU=%v", orderItems[i].SKU)
 		}
-		stockItems[i].reserved -= n
+		stockItems[i].Available += count
+		stockItems[i].Reserved -= count
 	}
 
 	for i := range stockItems {
@@ -131,21 +98,17 @@ func (s *Stock) ReserveRemove(_ context.Context, orderItems []model.OrderItem) e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	stockItems := make([]stockItem, 0, len(orderItems))
+	stockItems := make([]model.Stock, 0, len(orderItems))
 	for _, orderItem := range orderItems {
 		stockItems = append(stockItems, s.items[orderItem.SKU])
 	}
 
 	for i := range stockItems {
-		n := int64(orderItems[i].Count)
-		if stockItems[i].reserved < n {
-			return fmt.Errorf("insufficient count SKU=%v", orderItems[i].SKU)
-		}
-		if stockItems[i].reserved < n {
+		count := uint64(orderItems[i].Count)
+		if stockItems[i].Reserved < count {
 			return fmt.Errorf("insufficient reserved SKU=%v", orderItems[i].SKU)
 		}
-		stockItems[i].count -= n
-		stockItems[i].reserved -= n
+		stockItems[i].Reserved -= count
 	}
 
 	for i := range stockItems {

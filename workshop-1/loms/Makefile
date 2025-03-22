@@ -15,14 +15,20 @@ LINTBIN := bin/lint_$(GOVER)_$(LINTVER)$(EXE)
 
 all: format build test lint
 
-build: generate
+build: generate sqlc-generate tidy
 	GOOS=$(TARGET_OS) GOARCH=$(TARGET_ARCH) go build -o bin/app $(PACKAGE)
+
+sqlc-generate:
+	sqlc generate
 
 test:
 	go test ./...
 
 run:
 	go run $(PACKAGE)
+
+tidy:
+	go mod tidy
 
 lint: install-lint
 	$(LINTBIN) run

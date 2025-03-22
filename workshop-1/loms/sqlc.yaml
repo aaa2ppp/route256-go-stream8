@@ -5,9 +5,9 @@ sql:
     schema: "migrations"
     gen:
       go:
-        package: "order"
+        package: "queries"
         sql_package: "pgx/v5"
-        out: "internal/repo/order"
+        out: "internal/repo/order/queries"
         emit_json_tags: true
         emit_interface: true
         omit_unused_structs: true
@@ -16,9 +16,8 @@ sql:
     schema: "migrations"
     gen:
       go:
-        package: "stock"
+        package: "queries"
         sql_package: "pgx/v5"
-        out: "internal/repo/stock"
-        emit_json_tags: true
+        out: "internal/repo/stock/queries"
         emit_interface: true
         omit_unused_structs: true

@@ -8,8 +8,8 @@ CREATE TABLE "order" (
 );
 CREATE TABLE order_items (
     order_id BIGINT NOT NULL REFERENCES "order",
-    sku      BIGINT NOT NULL REFERENCES stock,
-    count    INT NOT NULL
+    sku      INT NOT NULL REFERENCES stock,
+    count    INT NOT NULL CHECK (count > 0)
 );
 -- +goose StatementEnd
 

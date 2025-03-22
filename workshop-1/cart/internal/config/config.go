@@ -31,7 +31,7 @@ type HTTPLOMSClient struct {
 	RequestTimeout       time.Duration
 }
 
-type GRPCLOMSClient struct {
+type GRPCClient struct {
 	Addr string
 }
 
@@ -49,7 +49,8 @@ type Config struct {
 	HTTPServer        *HTTPServer
 	HTTPLOMSClient    *HTTPLOMSClient
 	HTTPProductClient *HTTPProductClient
-	GRPCLOMSClient    *GRPCLOMSClient
+	GRPCLOMSClient    *GRPCClient
+	GRPCProductClient *GRPCClient
 	DB                *DB
 }
 
@@ -76,8 +77,11 @@ func Load() (Config, error) {
 			GetEndpoint:    "/get_product",
 			RequestTimeout: 10 * time.Second,
 		},
-		GRPCLOMSClient: &GRPCLOMSClient{
+		GRPCLOMSClient: &GRPCClient{
 			Addr: "loms:50051",
+		},
+		GRPCProductClient: &GRPCClient{
+			Addr: "route256.pavl.uk:8082",
 		},
 		DB: &DB{
 			Addr:          "db",

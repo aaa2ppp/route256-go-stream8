@@ -4,7 +4,7 @@ RETURNING order_id;
 
 -- name: AddItems :exec
 INSERT INTO order_items (order_id, sku, count)
-SELECT UNNEST($1::bigint[]) AS order_id, UNNEST($2::bigint[]) AS sku, UNNEST($3::int[]) AS count;
+SELECT UNNEST(@orders::bigint[]) AS order_id, UNNEST(@skus::bigint[]) AS sku, UNNEST(@counts::int[]) AS count;
 
 -- name: GetByID :many
 SELECT o.*, oi.sku, oi.count

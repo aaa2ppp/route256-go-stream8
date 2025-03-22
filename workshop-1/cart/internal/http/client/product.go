@@ -6,6 +6,7 @@ import (
 	"route256/cart/internal/config"
 	"route256/cart/internal/model"
 	"route256/cart/internal/service"
+	"route256/cart/pkg/http/middleware"
 )
 
 type Product struct {
@@ -30,12 +31,12 @@ type productGetInfoResponse struct {
 	Price uint32 `json:"price"`
 }
 
-func (c Product) GetInfo(ctx context.Context, req model.GetProductRequest) (resp model.GetProductResponse, _ error) {
+func (c Product) GetInfo(ctx context.Context, sku model.SKU) (resp model.GetProductResponse, _ error) {
 	log := getLogger(ctx, "Product.GetInfo")
 
 	creq := productGetInfoRequest{
-		Token: req.Token,
-		SKU:   req.SKU,
+		Token: middleware.GetAuthTokenFromContext(ctx),
+		SKU:   sku,
 	}
 
 	var cresp productGetInfoResponse

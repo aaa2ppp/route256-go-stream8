@@ -23,21 +23,18 @@ func (p *Cart) Add(_ context.Context, req model.AddCartItemRequest) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	cart := p.carts[req.UserID]
+	items := p.carts[req.UserID]
 
-reqItemsLoop:
-	for _, reqItem := range req.Items {
-		for i := range cart {
-			item := &cart[i]
-			if item.SKU == reqItem.SKU {
-				item.Count += reqItem.Count
-				continue reqItemsLoop
-			}
+	for i, item := range items {
+		if item.SKU == req.SKU {
+			items[i].Count = req.Count
+			return nil
 		}
-		cart = append(cart, model.CartItem{SKU: reqItem.SKU, Count: reqItem.Count})
 	}
 
-	p.carts[req.UserID] = cart
+	items = append(items, model.CartItem{SKU: req.SKU, Count: req.Count})
+	p.carts[req.UserID] = items
+
 	return nil
 }
 
@@ -45,14 +42,11 @@ func (p *Cart) Delete(_ context.Context, req model.DeleteCartItemRequest) error 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	cart := p.carts[req.UserID]
-	for i := range cart {
-		item := &cart[i]
-		if item.SKU == req.SKU {
-			n := len(cart)
-			cart[i] = cart[n-1]
-			cart = cart[:n-1]
-			p.carts[req.UserID] = cart
+	items := p.carts[req.UserID]
+
+	for i := range items {
+		if items[i].SKU == req.SKU {
+			p.carts[req.UserID] = append(items[:i], items[i+1:]...)
 			return nil
 		}
 	}
@@ -64,12 +58,13 @@ func (p *Cart) List(_ context.Context, userID model.UserID) ([]model.CartItem, e
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	cart := p.carts[userID]
-	if cart == nil {
+	items := p.carts[userID]
+
+	if items == nil {
 		return nil, model.ErrNotFound
 	}
 
-	return slices.Clone(cart), nil
+	return slices.Clone(items), nil
 }
 
 func (p *Cart) Clear(_ context.Context, userID model.UserID) error {

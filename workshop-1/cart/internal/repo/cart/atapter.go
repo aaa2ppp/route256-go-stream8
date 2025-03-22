@@ -3,43 +3,46 @@ package cart
 import (
 	"context"
 	"route256/cart/internal/model"
+	"route256/cart/internal/repo/cart/queries"
 	"route256/cart/internal/service"
+
+	"github.com/jackc/pgx/v5"
 )
 
-type Adapter struct {
-	*Queries
+type DB interface {
+	queries.DBTX
+	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-func NewQueriesAdapter(q *Queries) Adapter {
-	return Adapter{q}
+type Adapter struct {
+	db      DB
+	queries *queries.Queries
+}
+
+func New(db DB) *Adapter {
+	return &Adapter{
+		db:      db,
+		queries: queries.New(db),
+	}
 }
 
 // Add implements service.CartStorage.
 func (a Adapter) Add(ctx context.Context, req model.AddCartItemRequest) error {
-	n := len(req.Items)
-	user_ids := make([]int64, 0, n)
-	skus := make([]int32, 0, n)
-	counts := make([]int32, 0, n)
-	for _, item := range req.Items {
-		user_ids = append(user_ids, int64(req.UserID))
-		skus = append(skus, int32(item.SKU))
-		counts = append(counts, int32(item.Count))
-	}
-	return a.Queries.AddArrays(ctx, AddArraysParams{
-		Column1: user_ids,
-		Column2: skus,
-		Column3: counts,
+	return a.queries.Add(ctx, queries.AddParams{
+		UserID: int64(req.UserID),
+		Sku:    int32(req.SKU),
+		Count:  int32(req.Count),
 	})
 }
 
 // Clear implements service.CartStorage.
 func (a Adapter) Clear(ctx context.Context, userID model.UserID) error {
-	return a.Queries.Clear(ctx, int64(userID))
+	return a.queries.Clear(ctx, int64(userID))
 }
 
 // Delete implements service.CartStorage.
 func (a Adapter) Delete(ctx context.Context, req model.DeleteCartItemRequest) error {
-	return a.Queries.Delete(ctx, DeleteParams{
+	return a.queries.Delete(ctx, queries.DeleteParams{
 		UserID: int64(req.UserID),
 		Sku:    int32(req.SKU),
 	})
@@ -47,7 +50,7 @@ func (a Adapter) Delete(ctx context.Context, req model.DeleteCartItemRequest) er
 
 // List implements service.CartStorage.
 func (a Adapter) List(ctx context.Context, userID model.UserID) ([]model.CartItem, error) {
-	list, err := a.Queries.List(ctx, int64(userID))
+	list, err := a.queries.List(ctx, int64(userID))
 	if err != nil {
 		return nil, err
 	}

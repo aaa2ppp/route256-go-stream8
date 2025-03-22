@@ -38,8 +38,8 @@ func Run() int {
 		return 1
 	}
 
-	orderStor := orderRepo.Adapter{Queries: orderRepo.New(dbpool)}
-	stockStor := stockRepo.Adapter{Queries: stockRepo.New(dbpool)}
+	orderStor := orderRepo.New(dbpool)
+	stockStor := stockRepo.New(dbpool)
 
 	lomsService := service.NewLOMS(
 		orderStor,

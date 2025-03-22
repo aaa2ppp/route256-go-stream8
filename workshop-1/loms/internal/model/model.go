@@ -3,7 +3,7 @@ package model
 type (
 	OrderID int64
 	UserID  int64
-	SKU     int64
+	SKU     uint32
 )
 
 type Order struct {
@@ -15,11 +15,11 @@ type Order struct {
 
 type OrderItem struct {
 	SKU
-	Count int
+	Count uint16
 }
 
 type Stock struct {
 	SKU
-	Count    int64
-	Reserved int64
+	Available uint64
+	Reserved  uint64
 }

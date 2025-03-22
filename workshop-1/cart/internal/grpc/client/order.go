@@ -26,7 +26,7 @@ func (o *Order) CreateOrder(ctx context.Context, req model.OrderCreateRequest) (
 	}
 	for _, item := range req.Items {
 		creq.Items = append(creq.Items, &order.Item{
-			Sku:   int32(item.SKU),
+			Sku:   uint32(item.SKU),
 			Count: uint32(item.Count),
 		})
 	}
@@ -39,14 +39,14 @@ func (o *Order) CreateOrder(ctx context.Context, req model.OrderCreateRequest) (
 
 // GetStockInfo implements service.OrderStorage.
 func (o *Order) GetStockInfo(ctx context.Context, sku model.SKU) (count uint64, _ error) {
-	cresp, err := o.stock.GetInfo(ctx, &stock.GetInfoRequest{Sku: int32(sku)})
+	cresp, err := o.stock.GetInfo(ctx, &stock.GetInfoRequest{Sku: uint32(sku)})
 	if err != nil {
 		return 0, mapError(ctx, err)
 	}
 	return cresp.Count, nil
 }
 
-func NewOrder(cfg *config.GRPCLOMSClient) (*Order, error) {
+func NewOrder(cfg *config.GRPCClient) (*Order, error) {
 	conn, err := grpc.NewClient(cfg.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, fmt.Errorf("can't create grpc client connection: %w", err)
