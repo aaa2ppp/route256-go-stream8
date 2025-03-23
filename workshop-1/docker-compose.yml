@@ -24,13 +24,17 @@ services:
   #   ports:
   #     - "8082:8082"
   db:
-    image: postgres:17.2
+    image: postgres:${PGVER:-17.2}
+    #user: ${UID}:${GID}
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       PGDATA: /var/lib/postgresql/data/pgdata
     ports:
       - "5432:5432"
     volumes:
-      - ./db/config:/config
-      - ./db/initdb.d:/docker-entrypoint-initdb.d
-      - ./db/.docker/postgresql/data:/var/lib/postgresql/data
+      - ./db/config:/config:ro
+      - ./db/initdb.d:/docker-entrypoint-initdb.d:ro
+      #- ./db/.docker/postgresql/data:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
+volumes:
+    pgdata:

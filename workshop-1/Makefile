@@ -8,8 +8,12 @@ build-all: generate-all
 	cd cart && TARGET_OS=linux TARGET_ARCH=amd64 make build
 	cd notifications && TARGET_OS=linux TARGET_ARCH=amd64 make build
 
-run-all: build-all
+run-all: run-db build-all
 	docker-compose up --force-recreate --build
+
+run-db:
+	docker-compose up db -d
+
 
 precommit:
 	cd loms && make precommit

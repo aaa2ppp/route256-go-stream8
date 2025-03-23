@@ -15,7 +15,7 @@ LINTBIN := bin/lint_$(GOVER)_$(LINTVER)$(EXE)
 
 all: format build test lint
 
-build: generate sqlc-generate tidy
+build: generate migrate sqlc-generate tidy
 	GOOS=$(TARGET_OS) GOARCH=$(TARGET_ARCH) go build -o bin/app $(PACKAGE)
 
 sqlc-generate:
@@ -29,6 +29,10 @@ run:
 
 tidy:
 	go mod tidy
+
+.PHONY: migrate
+migrate:
+	sh ./migrate up
 
 lint: install-lint
 	$(LINTBIN) run

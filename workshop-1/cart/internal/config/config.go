@@ -2,7 +2,6 @@ package config
 
 import (
 	"log/slog"
-	"os"
 	"time"
 )
 
@@ -55,6 +54,9 @@ type Config struct {
 }
 
 func Load() (Config, error) {
+	const required = true
+	var ge getenv
+
 	return Config{
 		Logger: &Logger{
 			Level:     slog.LevelDebug,
@@ -85,9 +87,9 @@ func Load() (Config, error) {
 		},
 		DB: &DB{
 			Addr:          "db",
-			Name:          "cart",
-			User:          "cart",
-			Password:      os.Getenv("DB_PASSWORD"),
+			Name:          ge.String("DB_NAME", !required, "cart"),
+			User:          ge.String("DB_USER", !required, "cart"),
+			Password:      ge.String("DB_PASSWORD", required, ""),
 			SSLMode:       "disable",
 			WaitUpTimeout: 30 * time.Second,
 		},

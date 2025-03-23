@@ -2,7 +2,6 @@ package config
 
 import (
 	"log/slog"
-	"os"
 	"time"
 )
 
@@ -39,6 +38,9 @@ type Config struct {
 }
 
 func Load() (Config, error) {
+	const required = true
+	var ge getenv
+
 	return Config{
 		ShutdownTimeout: 30 * time.Second,
 		Logger: &Logger{
@@ -55,9 +57,9 @@ func Load() (Config, error) {
 		},
 		DB: &DB{
 			Addr:          "db",
-			Name:          "loms",
-			User:          "loms",
-			Password:      os.Getenv("DB_PASSWORD"),
+			Name:          ge.String("DB_NAME", !required, "loms"),
+			User:          ge.String("DB_USER", !required, "loms"),
+			Password:      ge.String("DB_PASSWORD", required, ""),
 			SSLMode:       "disable",
 			WaitUpTimeout: 30 * time.Second,
 		},

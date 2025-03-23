@@ -7,9 +7,17 @@
 
 . .env
 
-export PGHOST=localhost
-export PGDATABASE=${DB_USER:-cart}
-export PGUSER=${DB_NAME:-cart}
+if [ -n "$DOCKER_HOST" ]; then
+    DOCKER_HOST=${DOCKER_HOST#tcp://}
+    DOCKER_HOST=${DOCKER_HOST%:*}
+fi
+
+: ${DOCKER_HOST:=localhost}
+: ${MODULE:=$(sed -n '1s/module //p' go.mod)}
+
+export PGHOST=$DOCKER_HOST
+export PGDATABASE=${DB_USER:-$(basename $MODULE)}
+export PGUSER=${DB_NAME:-$(basename $MODULE)}
 export PGPASSWORD=${DB_PASSWORD?required}
 export PGSSLMODE=disable
 
