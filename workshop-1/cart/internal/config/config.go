@@ -30,8 +30,17 @@ type HTTPLOMSClient struct {
 	RequestTimeout       time.Duration
 }
 
-type GRPCLOMSClient struct {
+type GRPCClient struct {
 	Addr string
+}
+
+type DB struct {
+	Addr          string
+	Name          string
+	User          string
+	Password      string
+	SSLMode       string
+	WaitUpTimeout time.Duration
 }
 
 type Config struct {
@@ -39,10 +48,15 @@ type Config struct {
 	HTTPServer        *HTTPServer
 	HTTPLOMSClient    *HTTPLOMSClient
 	HTTPProductClient *HTTPProductClient
-	GRPCLOMSClient    *GRPCLOMSClient
+	GRPCLOMSClient    *GRPCClient
+	GRPCProductClient *GRPCClient
+	DB                *DB
 }
 
 func Load() (Config, error) {
+	const required = true
+	var ge getenv
+
 	return Config{
 		Logger: &Logger{
 			Level:     slog.LevelDebug,
@@ -65,8 +79,19 @@ func Load() (Config, error) {
 			GetEndpoint:    "/get_product",
 			RequestTimeout: 10 * time.Second,
 		},
-		GRPCLOMSClient: &GRPCLOMSClient{
+		GRPCLOMSClient: &GRPCClient{
 			Addr: "loms:50051",
+		},
+		GRPCProductClient: &GRPCClient{
+			Addr: "route256.pavl.uk:8082",
+		},
+		DB: &DB{
+			Addr:          "db",
+			Name:          ge.String("DB_NAME", !required, "cart"),
+			User:          ge.String("DB_USER", !required, "cart"),
+			Password:      ge.String("DB_PASSWORD", required, ""),
+			SSLMode:       "disable",
+			WaitUpTimeout: 30 * time.Second,
 		},
 	}, nil
 }

@@ -20,14 +20,27 @@ type GRPCServer struct {
 	Addr string
 }
 
+type DB struct {
+	Addr          string
+	Name          string
+	User          string
+	Password      string
+	SSLMode       string
+	WaitUpTimeout time.Duration
+}
+
 type Config struct {
 	ShutdownTimeout time.Duration
 	Logger          *Logger
 	HTTPServer      *HTTPServer
 	GRPCServer      *GRPCServer
+	DB              *DB
 }
 
 func Load() (Config, error) {
+	const required = true
+	var ge getenv
+
 	return Config{
 		ShutdownTimeout: 30 * time.Second,
 		Logger: &Logger{
@@ -41,6 +54,14 @@ func Load() (Config, error) {
 		},
 		GRPCServer: &GRPCServer{
 			Addr: ":50051",
+		},
+		DB: &DB{
+			Addr:          "db",
+			Name:          ge.String("DB_NAME", !required, "loms"),
+			User:          ge.String("DB_USER", !required, "loms"),
+			Password:      ge.String("DB_PASSWORD", required, ""),
+			SSLMode:       "disable",
+			WaitUpTimeout: 30 * time.Second,
 		},
 	}, nil
 }

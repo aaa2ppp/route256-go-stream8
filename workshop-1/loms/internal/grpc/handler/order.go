@@ -2,12 +2,14 @@ package handler
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"route256/loms/internal/model"
 	"route256/loms/pkg/api/order/v1"
 )
 
 type LomsService interface {
-	CreateOrder(ctx context.Context, req model.CreateOrderRequest) (resp model.CreateOrderResponse, err error)
+	CreateOrder(ctx context.Context, req model.CreateOrderRequest) (orderID model.OrderID, err error)
 	GetOrderInfo(ctx context.Context, orderID model.OrderID) (resp model.Order, err error)
 	PayOrder(ctx context.Context, orderID model.OrderID) error
 	CancelOrder(ctx context.Context, orderID model.OrderID) error
@@ -28,17 +30,20 @@ func (o Order) Create(ctx context.Context, req *order.CreateRequest) (*order.Cre
 		UserID: model.UserID(req.User),
 		Items:  make([]model.OrderItem, 0, len(req.Items)),
 	}
-	for _, item := range req.Items {
+	for i, item := range req.Items {
+		if item.Count > math.MaxInt16 {
+			return nil, fmt.Errorf("item[%d].count must be < 2^16", i)
+		}
 		mreq.Items = append(mreq.Items, model.OrderItem{
 			SKU:   model.SKU(item.Sku),
 			Count: uint16(item.Count),
 		})
 	}
-	mresp, err := o.service.CreateOrder(ctx, mreq)
+	orderID, err := o.service.CreateOrder(ctx, mreq)
 	if err != nil {
 		return nil, mapError(ctx, err)
 	}
-	return &order.CreateResponse{OrderID: int64(mresp.OrderID)}, nil
+	return &order.CreateResponse{OrderID: int64(orderID)}, nil
 }
 
 func (o Order) GetInfo(ctx context.Context, req *order.GetInfoRequest) (*order.GetInfoResponse, error) {
@@ -54,7 +59,7 @@ func (o Order) GetInfo(ctx context.Context, req *order.GetInfoRequest) (*order.G
 	}
 	for _, item := range mresp.Items {
 		resp.Items = append(resp.Items, &order.Item{
-			Sku:   int32(item.SKU),
+			Sku:   uint32(item.SKU),
 			Count: uint32(item.Count),
 		})
 	}

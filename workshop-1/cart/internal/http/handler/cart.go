@@ -32,21 +32,15 @@ func CartAddItem(addFunc func(ctx context.Context, req model.AddCartItemRequest)
 			return
 		}
 
-		token := x.getAuthToken()
-		if token == "" {
-			x.writeError(errUnauthorized)
-			return
-		}
-
 		var req cartAddItemRequest
 		if !x.decodeBodyAndValidateRequest(&req) {
 			return
 		}
 
 		if err := addFunc(x.ctx(), model.AddCartItemRequest{
-			Token:  token,
 			UserID: req.User,
-			Items:  []model.CartItem{{SKU: req.SKU, Count: req.Count}},
+			SKU:    req.SKU,
+			Count:  req.Count,
 		}); err != nil {
 			x.writeError(err)
 			return
@@ -122,17 +116,11 @@ type cartListResponse struct {
 	TotalPrice uint32         `json:"totalPrice"`
 }
 
-func CartList(listFunc func(ctx context.Context, req model.CartListRequest) (model.CartListResponse, error)) http.HandlerFunc {
+func CartList(listFunc func(ctx context.Context, userID model.UserID) (model.CartListResponse, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		x := newHelper(w, r, "CartList")
 
 		if !x.checkPOSTMethod() {
-			return
-		}
-
-		token := x.getAuthToken()
-		if token == "" {
-			x.writeError(errUnauthorized)
 			return
 		}
 
@@ -141,10 +129,7 @@ func CartList(listFunc func(ctx context.Context, req model.CartListRequest) (mod
 			return
 		}
 
-		cart, err := listFunc(x.ctx(), model.CartListRequest{
-			Token:  token,
-			UserID: req.User,
-		})
+		cart, err := listFunc(x.ctx(), req.User)
 		if err != nil {
 			x.writeError(err)
 			return

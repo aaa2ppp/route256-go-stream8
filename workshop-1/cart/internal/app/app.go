@@ -7,15 +7,21 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"syscall"
-
 	"route256/cart/internal/config"
 	grpcClient "route256/cart/internal/grpc/client"
 	httpClient "route256/cart/internal/http/client"
 	"route256/cart/internal/http/handler"
-	"route256/cart/internal/memstor"
+	cartRepo "route256/cart/internal/repo/cart"
 	"route256/cart/internal/service"
 	"route256/cart/pkg/http/middleware"
+	"syscall"
+)
+
+// чтобы именованые пакеты не "убегали"
+var (
+	_ = (*grpcClient.Product)(nil)
+	_ = (*httpClient.Product)(nil)
+	_ = (*cartRepo.Adapter)(nil)
 )
 
 func Run() int {
@@ -26,25 +32,46 @@ func Run() int {
 
 	setupDefaultLogger(cfg.Logger)
 
+	dbpool, err := openDB(context.Background(), cfg.DB)
+	if err != nil {
+		slog.Error(err.Error())
+		return 1
+	}
+	defer dbpool.Close()
+
+	// cartStor := memstor.NewCart()
+	cartStor := cartRepo.New(dbpool)
+
 	// lomsClient := httpClient.NewOrder(cfg.HTTPLOMSClient)
 	lomsClient, err := grpcClient.NewOrder(cfg.GRPCLOMSClient)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error(err.Error())
+		return 1
+	}
+
+	// productClient := httpClient.NewProduct(cfg.HTTPProductClient)
+	productClient, err := grpcClient.NewProduct(cfg.GRPCProductClient)
+	if err != nil {
+		slog.Error(err.Error())
+		return 1
 	}
 
 	cartService := service.NewCart(
-		memstor.NewCart(),
+		cartStor,
 		lomsClient,
-		httpClient.NewProduct(cfg.HTTPProductClient),
+		productClient,
 	)
 
+	cartMux := http.NewServeMux()
+	cartMux.Handle("POST /cart/item/add", handler.CartAddItem(cartService.Add))
+	cartMux.Handle("POST /cart/item/delete", handler.CartDeleteItem(cartService.Delete))
+	cartMux.Handle("POST /cart/list", handler.CartList(cartService.List))
+	cartMux.Handle("POST /cart/clear", handler.CartClear(cartService.Clear))
+	cartMux.Handle("POST /cart/checkout", handler.CartCheckout(cartService.Checkout))
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /ping", pong)
-	mux.Handle("POST /cart/item/add", handler.CartAddItem(cartService.Add))
-	mux.Handle("POST /cart/item/delete", handler.CartDeleteItem(cartService.Delete))
-	mux.Handle("POST /cart/list", handler.CartList(cartService.List))
-	mux.Handle("POST /cart/clear", handler.CartClear(cartService.Clear))
-	mux.Handle("POST /cart/checkout", handler.CartCheckout(cartService.Checkout))
+	mux.HandleFunc("/ping", pong)
+	mux.Handle("/cart/", middleware.Auth(cartMux))
 
 	httpServer := &http.Server{
 		Addr:         cfg.HTTPServer.Addr,

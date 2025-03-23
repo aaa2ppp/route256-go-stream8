@@ -60,7 +60,7 @@ type mock2ProductStorage struct {
 }
 
 // GetInfo implements ProductStorage.
-func (m *mock2ProductStorage) GetInfo(ctx context.Context, req model.GetProductRequest) (model.GetProductResponse, error) {
+func (m *mock2ProductStorage) GetInfo(ctx context.Context, sku model.SKU) (model.GetProductResponse, error) {
 	return model.GetProductResponse{Name: m.name, Price: m.price}, m.err
 }
 
@@ -87,9 +87,9 @@ func TestCart2_Add(t *testing.T) {
 			args: args{
 				ctx: context.Background(),
 				req: model.AddCartItemRequest{
-					Token:  "token",
 					UserID: 1,
-					Items:  []model.CartItem{{SKU: 1, Count: 2}},
+					SKU:    1,
+					Count:  2,
 				},
 			},
 			productStor: &mock2ProductStorage{err: nil},
@@ -101,24 +101,24 @@ func TestCart2_Add(t *testing.T) {
 			args: args{
 				ctx: context.Background(),
 				req: model.AddCartItemRequest{
-					Token:  "token",
 					UserID: 1,
-					Items:  []model.CartItem{{SKU: 1, Count: 2}},
+					SKU:    1,
+					Count:  2,
 				},
 			},
 			productStor: &mock2ProductStorage{err: model.ErrNotFound},
 			orderStor:   &mock2OrderStorage{count: 10, err: nil},
 			cartStor:    &mock2CartStorage{err: nil},
-			wantErr:     model.ErrPreconditionFailed,
+			wantErr:     model.ErrNotFound,
 		},
 		{
 			name: "product other error",
 			args: args{
 				ctx: context.Background(),
 				req: model.AddCartItemRequest{
-					Token:  "token",
 					UserID: 1,
-					Items:  []model.CartItem{{SKU: 1, Count: 2}},
+					SKU:    1,
+					Count:  2,
 				},
 			},
 			productStor: &mock2ProductStorage{err: errOtherError},
@@ -131,9 +131,9 @@ func TestCart2_Add(t *testing.T) {
 			args: args{
 				ctx: context.Background(),
 				req: model.AddCartItemRequest{
-					Token:  "token",
 					UserID: 1,
-					Items:  []model.CartItem{{SKU: 1, Count: 2}},
+					SKU:    1,
+					Count:  2,
 				},
 			},
 			productStor: &mock2ProductStorage{err: nil},
@@ -146,9 +146,9 @@ func TestCart2_Add(t *testing.T) {
 			args: args{
 				ctx: context.Background(),
 				req: model.AddCartItemRequest{
-					Token:  "token",
 					UserID: 1,
-					Items:  []model.CartItem{{SKU: 1, Count: 2}},
+					SKU:    1,
+					Count:  2,
 				},
 			},
 			productStor: &mock2ProductStorage{err: nil},
@@ -161,9 +161,9 @@ func TestCart2_Add(t *testing.T) {
 			args: args{
 				ctx: context.Background(),
 				req: model.AddCartItemRequest{
-					Token:  "token",
 					UserID: 1,
-					Items:  []model.CartItem{{SKU: 1, Count: 2}},
+					SKU:    1,
+					Count:  2,
 				},
 			},
 			productStor: &mock2ProductStorage{err: nil},

@@ -1,12 +1,26 @@
-build-all:
-	cd cart && GOOS=linux GOARCH=amd64 make build
-	cd loms && GOOS=linux GOARCH=amd64 make build
-	cd notifications && GOOS=linux GOARCH=amd64 make build
+generate-all:
+	cd loms && TARGET_OS=linux TARGET_ARCH=amd64 make generate
+	cd cart && TARGET_OS=linux TARGET_ARCH=amd64 make generate
+	cd notifications && TARGET_OS=linux TARGET_ARCH=amd64 make generate
 
-run-all: build-all
+build-all: generate-all
+	cd loms && TARGET_OS=linux TARGET_ARCH=amd64 make build
+	cd cart && TARGET_OS=linux TARGET_ARCH=amd64 make build
+	cd notifications && TARGET_OS=linux TARGET_ARCH=amd64 make build
+
+run-all: run-db build-all
 	docker-compose up --force-recreate --build
 
+run-db:
+	docker-compose up db -d
+
+
 precommit:
-	cd cart && make precommit
 	cd loms && make precommit
+	cd cart && make precommit
 	cd notifications && make precommit
+
+clean-all:
+	cd loms && make clean
+	cd cart && make clean
+	cd notifications && make clean

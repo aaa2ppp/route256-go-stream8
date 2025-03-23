@@ -21,12 +21,8 @@ func TestCart_Add(t *testing.T) {
 			userID: 1,
 			req: model.AddCartItemRequest{
 				UserID: 1,
-				Items: []model.CartItem{
-					{
-						SKU:   123,
-						Count: 2,
-					},
-				},
+				SKU:    123,
+				Count:  2,
 			},
 			wantItems: []model.CartItem{{SKU: 123, Count: 2}},
 			wantErr:   false,
@@ -36,48 +32,21 @@ func TestCart_Add(t *testing.T) {
 			userID: 1,
 			req: model.AddCartItemRequest{
 				UserID: 1,
-				Items: []model.CartItem{
-					{
-						SKU:   124,
-						Count: 3,
-					},
-				},
+				SKU:    124,
+				Count:  3,
 			},
 			wantItems: []model.CartItem{{SKU: 123, Count: 2}, {SKU: 124, Count: 3}},
 			wantErr:   false,
 		},
 		{
-			name:   "increase existing item count",
+			name:   "update existing item count",
 			userID: 1,
 			req: model.AddCartItemRequest{
 				UserID: 1,
-				Items: []model.CartItem{
-					{
-						SKU:   123,
-						Count: 3,
-					},
-				},
+				SKU:    123,
+				Count:  3,
 			},
-			wantItems: []model.CartItem{{SKU: 123, Count: 5}, {SKU: 124, Count: 3}},
-			wantErr:   false,
-		},
-		{
-			name:   "add new two items",
-			userID: 2,
-			req: model.AddCartItemRequest{
-				UserID: 2,
-				Items: []model.CartItem{
-					{
-						SKU:   123,
-						Count: 3,
-					},
-					{
-						SKU:   124,
-						Count: 4,
-					},
-				},
-			},
-			wantItems: []model.CartItem{{SKU: 123, Count: 3}, {SKU: 124, Count: 4}},
+			wantItems: []model.CartItem{{SKU: 123, Count: 3}, {SKU: 124, Count: 3}},
 			wantErr:   false,
 		},
 	}
@@ -114,12 +83,8 @@ func TestCart_Delete(t *testing.T) {
 	// Добавляем товар для тестирования удаления
 	err := cart.Add(context.Background(), model.AddCartItemRequest{
 		UserID: 1,
-		Items: []model.CartItem{
-			{
-				SKU:   123,
-				Count: 2,
-			},
-		},
+		SKU:    123,
+		Count:  2,
 	})
 	if err != nil {
 		t.Fatalf("Add() error = %v", err)
@@ -177,12 +142,8 @@ func TestCart_List(t *testing.T) {
 	// Добавляем товар для тестирования
 	err := cart.Add(context.Background(), model.AddCartItemRequest{
 		UserID: 1,
-		Items: []model.CartItem{
-			{
-				SKU:   123,
-				Count: 2,
-			},
-		},
+		SKU:    123,
+		Count:  2,
 	})
 	if err != nil {
 		t.Fatalf("Add() error = %v", err)
@@ -235,12 +196,8 @@ func TestCart_Clear(t *testing.T) {
 	// Добавляем товар для тестирования
 	err := cart.Add(context.Background(), model.AddCartItemRequest{
 		UserID: 1,
-		Items: []model.CartItem{
-			{
-				SKU:   123,
-				Count: 2,
-			},
-		},
+		SKU:    123,
+		Count:  2,
 	})
 	if err != nil {
 		t.Fatalf("Add() error = %v", err)

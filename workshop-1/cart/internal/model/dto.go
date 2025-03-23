@@ -1,24 +1,24 @@
 package model
 
 type AddCartItemRequest struct {
-	Token  string
-	UserID UserID
-	Items  []CartItem
+	UserID
+	SKU
+	Count uint16
 }
 
 type DeleteCartItemRequest struct {
-	UserID UserID
-	SKU    SKU
-}
-
-type GetProductRequest struct {
-	Token string
-	SKU   SKU
+	UserID
+	SKU
 }
 
 type GetProductResponse struct {
 	Name  string
 	Price uint32
+}
+
+type CartListResponse struct {
+	Items      []CartListItem
+	TotalPrice uint32
 }
 
 type CartListItem struct {
@@ -28,19 +28,9 @@ type CartListItem struct {
 	Price uint32
 }
 
-type CartListRequest struct {
-	UserID UserID
-	Token  string
-}
-
-type CartListResponse struct {
-	Items      []CartListItem
-	TotalPrice uint32
-}
-
-type OrderItem = CartItem
-
 type OrderCreateRequest struct {
 	UserID UserID
 	Items  []OrderItem
 }
+
+type OrderItem = CartItem

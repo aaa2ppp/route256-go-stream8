@@ -1,17 +1,17 @@
 package model
 
 type (
-	SKU     int32
+	SKU     uint32
 	UserID  int64
 	OrderID int64
 )
 
 type Cart struct {
-	UserID UserID
-	Items  []CartItem
+	UserID
+	Items []CartItem
 }
 
 type CartItem struct {
-	SKU   SKU
+	SKU
 	Count uint16
 }

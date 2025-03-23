@@ -41,7 +41,7 @@ type createOreserResponce struct {
 	OrderID model.OrderID `json:"orderID"`
 }
 
-func CreateOrder(crateFunc func(ctx context.Context, req model.CreateOrderRequest) (resp model.CreateOrderResponse, err error)) http.HandlerFunc {
+func CreateOrder(crateFunc func(ctx context.Context, req model.CreateOrderRequest) (orderID model.OrderID, err error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		x := newHelper(w, r, "CreateOrder")
 
@@ -61,13 +61,13 @@ func CreateOrder(crateFunc func(ctx context.Context, req model.CreateOrderReques
 			})
 		}
 
-		mresp, err := crateFunc(x.ctx(), mreq)
+		orderID, err := crateFunc(x.ctx(), mreq)
 		if err != nil {
 			x.writeError(err)
 			return
 		}
 
-		x.writeResponse(200, createOreserResponce{mresp.OrderID}) // or 201 ?
+		x.writeResponse(200, createOreserResponce{orderID}) // or 201 ?
 	}
 }
 

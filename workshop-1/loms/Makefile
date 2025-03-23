@@ -1,176 +1,196 @@
-CURDIR=$(shell pwd)
-BINDIR=${CURDIR}/bin
-GOVER=$(shell go version | perl -nle '/(go\d\S+)/; print $$1;')
-SMARTIMPORTS=${BINDIR}/smartimports_${GOVER}
-LINTVER=v1.64.4
-LINTBIN=${BINDIR}/lint_${GOVER}_${LINTVER}
-PACKAGE=route256/loms/cmd/app
+SHELL := bash -euo pipefail
+.DELETE_ON_ERROR:
+
+
+GOVER   := $(shell go env GOVERSION)
+MODULE  := $(shell sed -n '1s/module //p' go.mod)
+PACKAGE := $(MODULE)/cmd/app
+
+# Для виндовс содержить расширение .exe или пустую строку для других систем
+EXE := $(if $(filter windows,$(shell go env GOOS)),.exe)
+
+SMARTIMPORTS := bin/smartimports_$(GOVER)$(EXE)
+LINTVER := v1.64.4
+LINTBIN := bin/lint_$(GOVER)_$(LINTVER)$(EXE)
 
 all: format build test lint
 
-build: bindir
-	"${SHELL}" -c "go build -o ${BINDIR}/app ${PACKAGE}"
+build: generate migrate sqlc-generate tidy
+	GOOS=$(TARGET_OS) GOARCH=$(TARGET_ARCH) go build -o bin/app $(PACKAGE)
+
+sqlc-generate:
+	sqlc generate
 
 test:
 	go test ./...
 
 run:
-	go run ${PACKAGE}
+	go run $(PACKAGE)
 
-lint: install-lint
-	${LINTBIN} run
-
-precommit: format build test lint
-	echo "OK"
-
-bindir:
-	mkdir -p ${BINDIR}
-
-format: install-smartimports
-	${SMARTIMPORTS} -exclude internal/mocks
-
-install-lint: bindir
-	test -f ${LINTBIN} || \
-		(GOBIN=${BINDIR} go install github.com/golangci/golangci-lint/cmd/golangci-lint@${LINTVER} && \
-		mv ${BINDIR}/golangci-lint ${LINTBIN})
-
-install-smartimports: bindir
-	test -f ${SMARTIMPORTS} || \
-		(GOBIN=${BINDIR} go install github.com/pav5000/smartimports/cmd/smartimports@latest && \
-		mv ${BINDIR}/smartimports ${SMARTIMPORTS})
-
-
-# Используем bin в текущей директории для установки плагинов protoc
-LOCAL_BIN:=$(CURDIR)/bin
-
-# Добавляем bin в текущей директории в PATH при запуске protoc
-PROTOC = PATH="$$PATH:$(LOCAL_BIN)" protoc
-
-# Установка всех необходимых зависимостей
-.PHONY: .bin-deps
-# .bin-deps:
-# 	$(info Installing binary dependencies...)
-
-# 	GOBIN=$(LOCAL_BIN) go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-# 	GOBIN=$(LOCAL_BIN) go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
-# 	GOBIN=$(LOCAL_BIN) go install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-grpc-gateway@latest && \
-# 	GOBIN=$(LOCAL_BIN) go install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-openapiv2@latest && \
-# 	GOBIN=$(LOCAL_BIN) go install github.com/envoyproxy/protoc-gen-validate@latest && \
-# 	GOBIN=$(LOCAL_BIN) go install github.com/bufbuild/buf/cmd/buf@v1.21.0
-
-.bin-deps:
-	$(info Installing binary dependencies...)
-
-	GOBIN=$(LOCAL_BIN) go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-	GOBIN=$(LOCAL_BIN) go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
-	sh -c 'for f in $(LOCAL_BIN)/*.exe; do mv $$f $${f%.exe}; done'
-
-# Вендоринг внешних proto файлов
-.vendor-proto: .vendor-rm vendor-proto/google/api vendor-proto/google/protobuf vendor-proto/protoc-gen-openapiv2/options vendor-proto/validate 
-
-.PHONY: .vendor-rm
-.vendor-rm:
-	rm -rf vendor-proto
-
-# Устанавливаем proto описания google/googleapis
-vendor-proto/google/api:
-	git clone -b master --single-branch -n --depth=1 --filter=tree:0 \
- 		https://github.com/googleapis/googleapis vendor-proto/googleapis && \
- 	cd vendor-proto/googleapis && \
-	git sparse-checkout set --no-cone google/api && \
-	git checkout
-	mkdir -p  vendor-proto/google
-	mv vendor-proto/googleapis/google/api vendor-proto/google
-	rm -rf vendor-proto/googleapis
-
-# Устанавливаем proto описания protoc-gen-openapiv2/options
-vendor-proto/protoc-gen-openapiv2/options:
-	git clone -b main --single-branch -n --depth=1 --filter=tree:0 \
- 		https://github.com/grpc-ecosystem/grpc-gateway vendor-proto/grpc-ecosystem && \
- 	cd vendor-proto/grpc-ecosystem && \
-	git sparse-checkout set --no-cone protoc-gen-openapiv2/options && \
-	git checkout
-	mkdir -p vendor-proto/protoc-gen-openapiv2
-	mv vendor-proto/grpc-ecosystem/protoc-gen-openapiv2/options vendor-proto/protoc-gen-openapiv2
-	rm -rf vendor-proto/grpc-ecosystem
-
-	
-# Устанавливаем proto описания google/protobuf
-vendor-proto/google/protobuf:
-	git clone -b main --single-branch -n --depth=1 --filter=tree:0 \
-		https://github.com/protocolbuffers/protobuf vendor-proto/protobuf &&\
-	cd vendor-proto/protobuf &&\
-	git sparse-checkout set --no-cone src/google/protobuf &&\
-	git checkout
-	mkdir -p vendor-proto/google
-	mv vendor-proto/protobuf/src/google/protobuf vendor-proto/google
-	rm -rf vendor-proto/protobuf
-
-# Устанавливаем proto описания validate
-vendor-proto/validate:
-	git clone -b main --single-branch --depth=2 --filter=tree:0 \
-		https://github.com/bufbuild/protoc-gen-validate vendor-proto/tmp && \
-		cd vendor-proto/tmp && \
-		git sparse-checkout set --no-cone validate &&\
-		git checkout
-		mkdir -p vendor-proto/validate
-		mv vendor-proto/tmp/validate vendor-proto/
-		rm -rf vendor-proto/tmp
-
-
-ORDER_PROTO_PATH:="api/order/v1"
-STOCK_PROTO_PATH:="api/stock/v1"
-
-
-# # Генерация протофайлов с использованием protoc
-# PHONY: .protoc-generate
-# .protoc-generate: .bin-deps .vendor-proto
-# 	mkdir -p pkg/${LOMS_PROTO_PATH}
-# 	mkdir -p api/openapiv2
-# 	$(PROTOC) -I ${LOMS_PROTO_PATH} -I vendor-proto \
-# 	--plugin=protoc-gen-go=$(LOCAL_BIN)/protoc-gen-go --go_out pkg/${LOMS_PROTO_PATH} --go_opt paths=source_relative \
-# 	--plugin=protoc-gen-go-grpc=$(LOCAL_BIN)/protoc-gen-go-grpc --go-grpc_out pkg/${LOMS_PROTO_PATH} --go-grpc_opt paths=source_relative \
-# 	--plugin=protoc-gen-grpc-gateway=$(LOCAL_BIN)/protoc-gen-grpc-gateway --grpc-gateway_out pkg/${LOMS_PROTO_PATH} --grpc-gateway_opt logtostderr=true --grpc-gateway_opt paths=source_relative --grpc-gateway_opt generate_unbound_methods=true \
-# 	--plugin=protoc-gen-openapiv2=$(LOCAL_BIN)/protoc-gen-openapiv2 --openapiv2_out api/openapiv2 --openapiv2_opt logtostderr=true \
-# 	--plugin=protoc-gen-validate=$(LOCAL_BIN)/protoc-gen-validate --validate_out="lang=go,paths=source_relative:pkg/api/loms/v1" \
-# 	api/loms/v1/service.proto
-# 	go mod tidy
-
-# Генерация протофайлов с использованием protoc
-.PHONY: .protoc-generate
-.protoc-generate: .protoc-order-generate .protoc-stock-generate
+tidy:
 	go mod tidy
 
+.PHONY: migrate
+migrate:
+	sh ./migrate up
 
-.PHONY: .protoc-order-generate
-.protoc-order-generate: .bin-deps .vendor-proto
-	mkdir -p pkg/${ORDER_PROTO_PATH}
-	$(PROTOC) -I ${ORDER_PROTO_PATH} -I vendor-proto \
-	--plugin=protoc-gen-go=$(LOCAL_BIN)/protoc-gen-go --go_out pkg/${ORDER_PROTO_PATH} --go_opt paths=source_relative \
-	--plugin=protoc-gen-go-grpc=$(LOCAL_BIN)/protoc-gen-go-grpc --go-grpc_out pkg/${ORDER_PROTO_PATH} --go-grpc_opt paths=source_relative \
-	${ORDER_PROTO_PATH}/order.proto
+lint: install-lint
+	$(LINTBIN) run
 
-.PHONY: .protoc-stock-generate
-.protoc-stock-generate: .bin-deps .vendor-proto
-	mkdir -p pkg/${STOCK_PROTO_PATH}
-	$(PROTOC) -I ${STOCK_PROTO_PATH} -I vendor-proto \
-	--plugin=protoc-gen-go=$(LOCAL_BIN)/protoc-gen-go --go_out pkg/${STOCK_PROTO_PATH} --go_opt paths=source_relative \
-	--plugin=protoc-gen-go-grpc=$(LOCAL_BIN)/protoc-gen-go-grpc --go-grpc_out pkg/${STOCK_PROTO_PATH} --go-grpc_opt paths=source_relative \
-	${STOCK_PROTO_PATH}/stock.proto
+precommit: format build test lint
+	@echo "OK"
 
-# Генерация протофайлов с использованием protoc
+format: install-smartimports
+	$(SMARTIMPORTS) -exclude internal/mocks
+
+install-lint: $(LINTBIN)
+
+install-smartimports: $(SMARTIMPORTS)
+
+# Инсталяция бинарных зависимостей
+
+# Интсталируем в локальный bin
+GO_INSTALL := GOBIN=$(PWD)/bin go install
+
+# Зависимости которые нужно устновить
+BIN_DEPS := \
+	github.com/golangci/golangci-lint/cmd/golangci-lint@$(LINTVER);$(LINTBIN) \
+	github.com/pav5000/smartimports/cmd/smartimports@latest;$(SMARTIMPORTS)
+
+define GEN_BIN_RULE
+$$(lastword $$(subst ;, ,$(1))):
+	$(GO_INSTALL) $$(firstword $$(subst ;, ,$(1)))
+	$$(eval BIN := bin/$$(notdir $$(firstword $$(subst @, ,$(1))))$(EXE))
+	@test -f $$(BIN) || { echo "$$(BIN) not found"; exit 1; }
+	mv $$(BIN) $$@
+
+BIN_TARGETS += $$(lastword $$(subst ;, ,$(1)))
+endef
+
+$(foreach dep,$(BIN_DEPS),$(eval $(call GEN_BIN_RULE,$(dep))))
+
+.bin-targets:
+	@echo $(BIN_TARGETS)
+
+.bin-deps: $(BIN_TARGETS)
+	touch $@
+
+.PHONY: clean-bin-deps
+clean-bin-deps:
+	-rm -fr $(BIN_TARGETS) .bin-deps
+
+
+# Инсталяция плагинов protoc
+
+# Список плагинов protoc, их путей и версий
+PROTOC_DEPS := \
+	google.golang.org/protobuf/cmd/protoc-gen-go@latest \
+	google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest \
+	github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-grpc-gateway@latest \
+	github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-openapiv2@latest \
+	github.com/envoyproxy/protoc-gen-validate@latest
+
+
+define GEN_PROTOC_RULE
+bin/$$(notdir $$(firstword $$(subst @, ,$(1))))$(EXE):
+	$(GO_INSTALL) $(1)
+	$$(eval BIN := bin/$$(notdir $$(firstword $$(subst @, ,$(1))))$(EXE))
+	@test -f $$(BIN) || { echo "$$(BIN) not found"; exit 1; }
+
+PROTOC_TARGETS += bin/$$(notdir $$(firstword $$(subst @, ,$(1))))$(EXE)
+endef
+
+$(foreach dep,$(PROTOC_DEPS),$(eval $(call GEN_PROTOC_RULE,$(dep))))
+
+.protoc-targets:
+	@echo $(PROTOC_TARGETS)
+
+.protoc-deps: $(PROTOC_TARGETS)
+	touch $@
+
+.PHONY: clean-protoc-deps
+clean-protoc-deps:
+	-rm -fr $(PROTOC_TARGETS) .protoc-deps
+
+
+# Вендоринг внешних proto файлов
+
+VENDOR_DIR = vendor-proto
+GIT_CLONE = git clone -q --single-branch -n --filter=tree:0
+GIT_CHECKOUT = git sparse-checkout set --no-cone
+
+# Список зависимостей для вендоринга
+VENDOR_DEPS = \
+    google/api;master;https://github.com/googleapis/googleapis;google/api \
+    protoc-gen-openapiv2/options;main;https://github.com/grpc-ecosystem/grpc-gateway;protoc-gen-openapiv2/options \
+    google/protobuf;main;https://github.com/protocolbuffers/protobuf;src/google/protobuf \
+    validate;main;https://github.com/bufbuild/protoc-gen-validate;validate
+
+define GEN_VENDOR_RULE
+$(VENDOR_DIR)/$$(firstword $$(subst ;, ,$(1))):
+	$$(eval TEMP_DIR := $$(shell mkdir -p $(VENDOR_DIR) && mktemp -d $(VENDOR_DIR)/tmp.XXXXXXXX))
+	$$(eval PARAMS   := $$(wordlist 2, 999, $(subst ;, ,$(1))))
+	$$(eval BRANCH   := $$(word 1,$$(PARAMS)))
+	$$(eval REPO_URL := $$(word 2,$$(PARAMS)))
+	$$(eval SRC_PATH := $$(word 3,$$(PARAMS)))
+
+	$(GIT_CLONE) -b $$(BRANCH) --depth=1 $$(REPO_URL) $$(TEMP_DIR)
+	cd $$(TEMP_DIR) && $(GIT_CHECKOUT) $$(SRC_PATH) && git checkout -q
+	mkdir -p $$(@D) && mv $$(TEMP_DIR)/$$(SRC_PATH) $$@
+	rm -fr $$(TEMP_DIR)
+
+VENDOR_TARGETS += $(VENDOR_DIR)/$$(firstword $$(subst ;, ,$(1)))
+endef
+
+$(foreach dep,$(VENDOR_DEPS),$(eval $(call GEN_VENDOR_RULE,$(dep))))
+
+.vendor-targets:
+	@echo $(VENDOR_TARGETS)
+
+.vendor-deps: $(VENDOR_TARGETS)
+	touch .vendor-deps
+
+.PHONY: clean-vendor-deps
+clean-vendor-deps:
+	-rm -fr $(VENDOR_TARGETS) .vendor-deps
+
+
+# Генерация сервисов по их ptoto описаниям
+
+# Список proto описаний сервисов
+SERVICE_PROTOS := \
+	api/order/v1/order.proto \
+	api/stock/v1/stock.proto
+
+define GEN_SERVICE_RULE
+pkg/$$(dir $(1)): $(1) .protoc-deps .vendor-deps
+	mkdir -p $$@
+	-rm -fr $$@/*
+	protoc -I $$(dir $$<) -I vendor-proto \
+		--plugin=bin/protoc-gen-go$$(EXE) --go_out $$@ --go_opt paths=source_relative \
+		--plugin=bin/protoc-gen-go-grpc$$(EXE) --go-grpc_out $$@ --go-grpc_opt paths=source_relative \
+		$$<
+
+SERVICE_TARGETS += pkg/$$(dir $(1))
+endef
+
+$(foreach service,$(SERVICE_PROTOS),$(eval $(call GEN_SERVICE_RULE,$(service))))
+
+.service-targets:
+	@echo $(SERVICE_TARGETS)
+
 .PHONY: generate
-generate: .bin-deps .vendor-proto .protoc-generate
+generate: .generate
 
-.PHONY: fast-generate
-fast-generate: .protoc-generate
+.PHONY: clean-generate
+.generate: $(SERVICE_TARGETS) .protoc-deps .vendor-deps
+	touch $@
+clean-generate:
+	-rm -fr $(SERVICE_TARGETS) .generate
 
-# Генерация протофайлов с использованием buf
-.PHONY: generate-buf
-generate-buf: .bin-deps .vendor-rm .buf-generate
 
-# Генерация протофайлов с использованием buf
-.PHONY: .buf-generate
-.buf-generate: 
-	PATH=$(LOCAL_BIN):$(PATH) $(LOCAL_BIN)/buf mod update
-	PATH=$(LOCAL_BIN):$(PATH) $(LOCAL_BIN)/buf generate
+# clean
+
+.PHONY: clean
+clean: clean-bin-deps clean-protoc-deps clean-vendor-deps clean-generate
+	-rm -fr bin

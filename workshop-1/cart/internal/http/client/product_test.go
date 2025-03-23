@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"route256/cart/internal/config"
 	"route256/cart/internal/model"
+	"route256/cart/pkg/http/middleware"
 	"testing"
 	"time"
 
@@ -19,7 +20,8 @@ func TestProduct_GetInfo(t *testing.T) {
 	tests := []struct {
 		name          string
 		handler       http.HandlerFunc
-		request       model.GetProductRequest
+		request       model.SKU
+		token         string
 		expectedResp  model.GetProductResponse
 		expectedError error
 	}{
@@ -41,10 +43,8 @@ func TestProduct_GetInfo(t *testing.T) {
 					Price: 1000,
 				})
 			},
-			request: model.GetProductRequest{
-				Token: "token123",
-				SKU:   456,
-			},
+			request: 456,
+			token:   "token123",
 			expectedResp: model.GetProductResponse{
 				Name:  "Product 1",
 				Price: 1000,
@@ -57,10 +57,8 @@ func TestProduct_GetInfo(t *testing.T) {
 				time.Sleep(requestTimeout * 2)
 				w.WriteHeader(http.StatusOK)
 			},
-			request: model.GetProductRequest{
-				Token: "token123",
-				SKU:   456,
-			},
+			request:       456,
+			token:         "token123",
 			expectedResp:  model.GetProductResponse{},
 			expectedError: model.ErrInternalError,
 		},
@@ -69,10 +67,8 @@ func TestProduct_GetInfo(t *testing.T) {
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusNotFound)
 			},
-			request: model.GetProductRequest{
-				Token: "token123",
-				SKU:   456,
-			},
+			request:       456,
+			token:         "token123",
 			expectedResp:  model.GetProductResponse{},
 			expectedError: model.ErrNotFound,
 		},
@@ -81,10 +77,8 @@ func TestProduct_GetInfo(t *testing.T) {
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusInternalServerError)
 			},
-			request: model.GetProductRequest{
-				Token: "token123",
-				SKU:   456,
-			},
+			request:       456,
+			token:         "token123",
 			expectedResp:  model.GetProductResponse{},
 			expectedError: model.ErrInternalError,
 		},
@@ -102,7 +96,11 @@ func TestProduct_GetInfo(t *testing.T) {
 			}
 			client := NewProduct(cfg)
 
-			resp, err := client.GetInfo(context.Background(), tt.request)
+			ctx := context.Background()
+			if tt.token != "" {
+				ctx = middleware.ContextWithAuthToken(ctx, tt.token)
+			}
+			resp, err := client.GetInfo(ctx, tt.request)
 
 			require.Equal(t, tt.expectedResp, resp)
 			require.True(t, errors.Is(err, tt.expectedError))

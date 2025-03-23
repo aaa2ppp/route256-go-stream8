@@ -1,0 +1,3993 @@
+// === cart/cmd/app/main.go ===
+package main
+
+import (
+	"os"
+	"route256/cart/internal/app"
+)
+
+func main() {
+	os.Exit(app.Run())
+}
+
+// === cart/internal/app/app.go ===
+package app
+
+import (
+	"context"
+	"log"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"route256/cart/internal/config"
+	grpcClient "route256/cart/internal/grpc/client"
+	httpClient "route256/cart/internal/http/client"
+	"route256/cart/internal/http/handler"
+	cartRepo "route256/cart/internal/repo/cart"
+	"route256/cart/internal/service"
+	"route256/cart/pkg/http/middleware"
+	"syscall"
+)
+
+func Run() int {
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("can't load config: %v", err)
+	}
+
+	setupDefaultLogger(cfg.Logger)
+
+	dbpool, err := openDB(context.Background(), cfg.DB)
+	if err != nil {
+		slog.Error(err.Error())
+		return 1
+	}
+	defer dbpool.Close()
+
+	// cartStor := memstor.NewCart()
+	cartStor := cartRepo.Adapter{Queries: cartRepo.New(dbpool)}
+
+	// lomsClient := httpClient.NewOrder(cfg.HTTPLOMSClient)
+	lomsClient, err := grpcClient.NewOrder(cfg.GRPCLOMSClient)
+	if err != nil {
+		slog.Error(err.Error())
+		return 1
+	}
+
+	productClient := httpClient.NewProduct(cfg.HTTPProductClient)
+
+	cartService := service.NewCart(
+		cartStor,
+		lomsClient,
+		productClient,
+	)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /ping", pong)
+	mux.Handle("POST /cart/item/add", handler.CartAddItem(cartService.Add))
+	mux.Handle("POST /cart/item/delete", handler.CartDeleteItem(cartService.Delete))
+	mux.Handle("POST /cart/list", handler.CartList(cartService.List))
+	mux.Handle("POST /cart/clear", handler.CartClear(cartService.Clear))
+	mux.Handle("POST /cart/checkout", handler.CartCheckout(cartService.Checkout))
+
+	httpServer := &http.Server{
+		Addr:         cfg.HTTPServer.Addr,
+		Handler:      middleware.Logging(slog.Default(), mux),
+		ReadTimeout:  cfg.HTTPServer.ReadTimeout,
+		WriteTimeout: cfg.HTTPServer.WriteTimeout,
+	}
+
+	done := make(chan int)
+	go func() {
+		defer close(done)
+
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+		sig := <-c
+
+		slog.Info("shutdown by signal", "signal", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.HTTPServer.ShutdownTimeout)
+		defer cancel()
+		if err := httpServer.Shutdown(ctx); err != nil {
+			slog.Error("can't shutdown http server", "error", err)
+			done <- 1
+		}
+	}()
+
+	slog.Info("http server startup", "addr", httpServer.Addr)
+	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		slog.Error("http server fail", "error", err)
+		return 1
+	}
+
+	slog.Info("http server stopped")
+	return <-done
+}
+
+func setupDefaultLogger(cfg *config.Logger) {
+	var handler slog.Handler
+	if cfg.PlainText {
+		handler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.Level})
+	} else {
+		handler = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.Level})
+	}
+	slog.SetDefault(slog.New(handler).With("app", "cart"))
+}
+
+func pong(w http.ResponseWriter, h *http.Request) {
+	if _, err := w.Write([]byte("pong")); err != nil {
+		slog.Error("ping: can't write pong")
+	}
+}
+
+// === cart/internal/app/opendb.go ===
+package app
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/url"
+	"reflect"
+	"route256/cart/internal/config"
+	"slices"
+	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func getDBConnectString(cfg *config.DB) string {
+	q := url.Values{}
+	if cfg.SSLMode != "" {
+		q.Set("sslmode", cfg.SSLMode)
+	}
+	u := url.URL{
+		Scheme:   "postgres",
+		Host:     cfg.Addr,
+		User:     url.UserPassword(cfg.User, cfg.Password),
+		Path:     cfg.Name,
+		RawQuery: q.Encode(),
+	}
+	return u.String()
+}
+
+func waitDBUp(ctx context.Context, dbpool *pgxpool.Pool) error {
+	const (
+		initialBackoff = 1 * time.Second
+		maxBackoff     = 10 * time.Second
+	)
+
+	var timer *time.Timer
+	backoff := initialBackoff
+
+	for {
+		// Выполняем проверку подключения
+		err := dbpool.Ping(ctx)
+		if err == nil {
+			return nil
+		}
+		if !isRetryableError(err) {
+			return fmt.Errorf("non-retryable error: %w", err)
+		}
+
+		slog.Debug("connection will be retry", "error", err, "backoff", backoff)
+		if timer == nil {
+			timer = time.NewTimer(backoff)
+		} else {
+			timer.Reset(backoff)
+		}
+
+		// Ждем следующей попытки или завершения контекста
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			// Экспоненциальный рост с ограничением
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
+func openDB(ctx context.Context, cfg *config.DB) (_ *pgxpool.Pool, err error) {
+	dsn := getDBConnectString(cfg)
+
+	dbpool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("create pool: %w", err)
+	}
+
+	defer func() {
+		if err != nil {
+			dbpool.Close()
+		}
+	}()
+
+	if cfg.WaitUpTimeout > 0 {
+		waitCtx, cancel := context.WithTimeout(ctx, cfg.WaitUpTimeout)
+		defer cancel()
+
+		waitErr := waitDBUp(waitCtx, dbpool)
+		if waitErr == nil {
+			return dbpool, nil
+		}
+
+		if !errors.Is(waitErr, context.DeadlineExceeded) || ctx.Err() != nil {
+			return nil, fmt.Errorf("wait for DB failed: %w", waitErr)
+		}
+
+		slog.Debug("wait timeout exceeded, performing final ping")
+	}
+
+	if err := dbpool.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("initial ping failed: %w", err)
+	}
+
+	return dbpool, nil
+}
+
+func isRetryableError(err error) bool {
+	// Если контекст завершен, не повторяем
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+
+	// Сетевые ошибки
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() || errors.Is(netErr, syscall.ECONNREFUSED) {
+			return true
+		}
+		return false
+	}
+
+	// Ошибки PostgreSQL
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		// Список фатальных ошибок из официальной документации:
+		// https://www.postgresql.org/docs/current/errcodes-appendix.html
+		fatalCodes := []string{
+			"28P01", // Invalid password
+			"3D000", // Database does not exist
+			"42501", // Insufficient privilege
+			"42601", // Syntax error
+			"42703", // Undefined column
+			"42P01", // Undefined table
+		}
+		return !slices.Contains(fatalCodes, pgErr.Code)
+	}
+
+	// По умолчанию считаем ошибку повторимой
+	slog.Debug("isRetryableError: unknown error", "error", err, "errorType", reflect.TypeOf(err))
+	return true
+}
+
+// === cart/internal/config/config.go ===
+package config
+
+import (
+	"log/slog"
+	"os"
+	"time"
+)
+
+type Logger struct {
+	Level     slog.Level
+	PlainText bool
+}
+
+type HTTPServer struct {
+	Addr            string
+	ReadTimeout     time.Duration
+	WriteTimeout    time.Duration
+	ShutdownTimeout time.Duration
+}
+
+type HTTPProductClient struct {
+	BaseURL        string
+	GetEndpoint    string
+	RequestTimeout time.Duration
+}
+
+type HTTPLOMSClient struct {
+	BaseURL              string
+	CreateOrderEndpoint  string
+	GetStockInfoEndpoint string
+	RequestTimeout       time.Duration
+}
+
+type GRPCLOMSClient struct {
+	Addr string
+}
+
+type DB struct {
+	Addr          string
+	Name          string
+	User          string
+	Password      string
+	SSLMode       string
+	WaitUpTimeout time.Duration
+}
+
+type Config struct {
+	Logger            *Logger
+	HTTPServer        *HTTPServer
+	HTTPLOMSClient    *HTTPLOMSClient
+	HTTPProductClient *HTTPProductClient
+	GRPCLOMSClient    *GRPCLOMSClient
+	DB                *DB
+}
+
+func Load() (Config, error) {
+	return Config{
+		Logger: &Logger{
+			Level:     slog.LevelDebug,
+			PlainText: true,
+		},
+		HTTPServer: &HTTPServer{
+			Addr:            ":8080",
+			ReadTimeout:     10 * time.Second,
+			WriteTimeout:    10 * time.Second,
+			ShutdownTimeout: 30 * time.Second,
+		},
+		HTTPLOMSClient: &HTTPLOMSClient{
+			BaseURL:              "http://loms:8080",
+			CreateOrderEndpoint:  "/order/create",
+			GetStockInfoEndpoint: "/stock/info",
+			RequestTimeout:       10 * time.Second,
+		},
+		HTTPProductClient: &HTTPProductClient{
+			BaseURL:        "http://route256.pavl.uk:8080",
+			GetEndpoint:    "/get_product",
+			RequestTimeout: 10 * time.Second,
+		},
+		GRPCLOMSClient: &GRPCLOMSClient{
+			Addr: "loms:50051",
+		},
+		DB: &DB{
+			Addr:          "db",
+			Name:          "cart",
+			User:          "cart",
+			Password:      os.Getenv("DB_PASSWORD"),
+			SSLMode:       "disable",
+			WaitUpTimeout: 30 * time.Second,
+		},
+	}, nil
+}
+
+// === cart/internal/grpc/client/maperr.go ===
+package client
+
+import (
+	"context"
+	"route256/cart/internal/model"
+	"route256/cart/pkg/http/middleware"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+func mapError(ctx context.Context, err error) error {
+	st, ok := status.FromError(err)
+	if !ok {
+		log := middleware.GetLoggerFromContextOrDefault(ctx)
+		log.Warn("non-gRPC error detected", "error", err)
+		return model.ErrInternalError
+	}
+	switch st.Code() {
+	case codes.NotFound:
+		return model.ErrNotFound
+	case codes.FailedPrecondition:
+		return model.ErrPreconditionFailed
+	case codes.Internal:
+		return model.ErrInternalError
+	}
+	log := middleware.GetLoggerFromContextOrDefault(ctx)
+	log.Warn("unexpected status code", "code", st.Code())
+	return model.ErrInternalError
+}
+
+// === cart/internal/grpc/client/order.go ===
+package client
+
+import (
+	"context"
+	"fmt"
+	"route256/cart/internal/config"
+	"route256/cart/internal/model"
+	"route256/cart/internal/service"
+	"route256/loms/pkg/api/order/v1"
+	"route256/loms/pkg/api/stock/v1"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+)
+
+type Order struct {
+	order order.OrderClient
+	stock stock.StockClient
+}
+
+// CreateOrder implements service.OrderStorage.
+func (o *Order) CreateOrder(ctx context.Context, req model.OrderCreateRequest) (model.OrderID, error) {
+	creq := &order.CreateRequest{
+		User:  int64(req.UserID),
+		Items: make([]*order.Item, 0, len(req.Items)),
+	}
+	for _, item := range req.Items {
+		creq.Items = append(creq.Items, &order.Item{
+			Sku:   int32(item.SKU),
+			Count: uint32(item.Count),
+		})
+	}
+	cresp, err := o.order.Create(ctx, creq)
+	if err != nil {
+		return 0, mapError(ctx, err)
+	}
+	return model.OrderID(cresp.OrderID), nil
+}
+
+// GetStockInfo implements service.OrderStorage.
+func (o *Order) GetStockInfo(ctx context.Context, sku model.SKU) (count uint64, _ error) {
+	cresp, err := o.stock.GetInfo(ctx, &stock.GetInfoRequest{Sku: int32(sku)})
+	if err != nil {
+		return 0, mapError(ctx, err)
+	}
+	return cresp.Count, nil
+}
+
+func NewOrder(cfg *config.GRPCLOMSClient) (*Order, error) {
+	conn, err := grpc.NewClient(cfg.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("can't create grpc client connection: %w", err)
+	}
+	order := order.NewOrderClient(conn)
+	stock := stock.NewStockClient(conn)
+	return &Order{
+		order: order,
+		stock: stock,
+	}, nil
+}
+
+var _ service.OrderStorage = &Order{}
+
+// === cart/internal/http/client/client.go ===
+package client
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+)
+
+// client HTTP клиент для взаимодействия с API
+type client struct {
+	baseURL string
+	client  *http.Client
+}
+
+// newClient создает новый экземпляр клиента
+func newClient(baseURL string, requestTimeout time.Duration) client {
+	return client{
+		baseURL: baseURL,
+		client: &http.Client{
+			Timeout: requestTimeout,
+		},
+	}
+}
+
+// doRequest выполняет POST запрос и обрабатывает ответ
+func (c client) doRequest(ctx context.Context, endpoint string, req, resp any) (status int, _ error) {
+
+	// Подготовка тела запроса
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return 0, fmt.Errorf("marshal request: %w", err)
+	}
+
+	// Создание запроса
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+endpoint, bytes.NewReader(reqBody))
+	if err != nil {
+		return 0, fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+
+	// Выполнение запроса
+	httpResp, err := c.client.Do(httpReq)
+	if err != nil {
+		return 0, fmt.Errorf("execute request: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	status = httpResp.StatusCode
+
+	// Чтение ответа
+	respBody, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return status, fmt.Errorf("read body failed: %w", err)
+	}
+
+	// Декодирование ответа
+	if status == 200 || status == 201 {
+		if err := json.Unmarshal(respBody, resp); err != nil {
+			return status, fmt.Errorf("unmarshal response: %w", err)
+		}
+	}
+
+	return status, nil
+}
+
+// === cart/internal/http/client/logger.go ===
+package client
+
+import (
+	"context"
+	"log/slog"
+	"route256/cart/pkg/http/middleware"
+)
+
+func getLogger(ctx context.Context, op string) *slog.Logger {
+	return middleware.GetLoggerFromContextOrDefault(ctx).
+		With("op", "client#"+op)
+}
+
+// === cart/internal/http/client/order.go ===
+package client
+
+import (
+	"context"
+	"net/http"
+	"route256/cart/internal/config"
+	"route256/cart/internal/model"
+	"route256/cart/internal/service"
+)
+
+type Order struct {
+	client
+	cfg *config.HTTPLOMSClient
+}
+
+func NewOrder(cfg *config.HTTPLOMSClient) Order {
+	return Order{
+		client: newClient(cfg.BaseURL, cfg.RequestTimeout),
+		cfg:    cfg,
+	}
+}
+
+type createOrderItem struct {
+	SKU   model.SKU `json:"sku"`
+	Count uint16    `json:"count"`
+}
+
+type createOrderRequest struct {
+	User  model.UserID      `json:"user"`
+	Items []createOrderItem `json:"items"`
+}
+
+type createOrderResponse struct {
+	OrderID model.OrderID `json:"orderID"`
+}
+
+func (c Order) CreateOrder(ctx context.Context, req model.OrderCreateRequest) (resp model.OrderID, _ error) {
+	log := getLogger(ctx, "Order.CreateOrder")
+
+	creq := createOrderRequest{
+		User:  req.UserID,
+		Items: make([]createOrderItem, 0, len(req.Items)),
+	}
+	for _, item := range req.Items {
+		creq.Items = append(creq.Items, createOrderItem{
+			SKU:   item.SKU,
+			Count: item.Count,
+		})
+	}
+
+	var cresp createOrderResponse
+	status, err := c.doRequest(ctx, c.cfg.CreateOrderEndpoint, &creq, &cresp)
+	if err != nil {
+		log.Error("can't do request", "error", err)
+		return resp, model.ErrInternalError
+	}
+
+	switch status {
+	case http.StatusOK, http.StatusCreated:
+		return cresp.OrderID, nil
+	case http.StatusPreconditionFailed:
+		return resp, model.ErrPreconditionFailed
+	}
+
+	log.Error("unknown response status", "status", status)
+	return resp, model.ErrInternalError
+}
+
+type getStockInfoRequest struct {
+	SKU model.SKU `json:"sku"`
+}
+
+type getStockInfoResponse struct {
+	Count uint64 `json:"count"`
+}
+
+func (c Order) GetStockInfo(ctx context.Context, sku model.SKU) (count uint64, _ error) {
+	log := getLogger(ctx, "Order.GetStockInfo")
+
+	creq := getStockInfoRequest{
+		SKU: sku,
+	}
+
+	var cresp getStockInfoResponse
+	status, err := c.doRequest(ctx, c.cfg.GetStockInfoEndpoint, &creq, &cresp)
+	if err != nil {
+		log.Error("can't do request", "error", err)
+		return count, model.ErrInternalError
+	}
+
+	switch status {
+	case http.StatusOK:
+		return cresp.Count, nil
+	case http.StatusNotFound:
+		return count, model.ErrNotFound
+	}
+
+	log.Error("unknown response status", "status", status)
+	return count, model.ErrInternalError
+}
+
+var _ service.OrderStorage = &Order{}
+
+// === cart/internal/http/client/product.go ===
+package client
+
+import (
+	"context"
+	"net/http"
+	"route256/cart/internal/config"
+	"route256/cart/internal/model"
+	"route256/cart/internal/service"
+)
+
+type Product struct {
+	client
+	cfg *config.HTTPProductClient
+}
+
+func NewProduct(cfg *config.HTTPProductClient) Product {
+	return Product{
+		client: newClient(cfg.BaseURL, cfg.RequestTimeout),
+		cfg:    cfg,
+	}
+}
+
+type productGetInfoRequest struct {
+	Token string    `json:"token"`
+	SKU   model.SKU `json:"sku"`
+}
+
+type productGetInfoResponse struct {
+	Name  string `json:"name"`
+	Price uint32 `json:"price"`
+}
+
+func (c Product) GetInfo(ctx context.Context, req model.GetProductRequest) (resp model.GetProductResponse, _ error) {
+	log := getLogger(ctx, "Product.GetInfo")
+
+	creq := productGetInfoRequest{
+		Token: req.Token,
+		SKU:   req.SKU,
+	}
+
+	var cresp productGetInfoResponse
+	status, err := c.doRequest(ctx, c.cfg.GetEndpoint, &creq, &cresp)
+	if err != nil {
+		log.Error("can't do request", "error", err)
+		return resp, model.ErrInternalError
+	}
+
+	switch status {
+	case http.StatusOK:
+		return model.GetProductResponse{
+			Name:  cresp.Name,
+			Price: cresp.Price,
+		}, nil
+	case http.StatusUnauthorized:
+		return resp, model.ErrUnauthorized
+	case http.StatusNotFound:
+		return resp, model.ErrNotFound
+	}
+
+	log.Error("unknown response status", "status", status)
+	return resp, model.ErrInternalError
+}
+
+var _ service.ProductStorage = &Product{}
+
+// === cart/internal/http/handler/cart.go ===
+package handler
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"route256/cart/internal/model"
+)
+
+type cartAddItemRequest struct {
+	User  model.UserID `json:"user"`
+	SKU   model.SKU    `json:"sku"`
+	Count uint16       `json:"count"`
+}
+
+func (req cartAddItemRequest) Validate() error {
+	var errs []error
+	if req.User <= 0 {
+		errs = append(errs, errors.New("user must be > 0"))
+	}
+	if req.SKU <= 0 {
+		errs = append(errs, errors.New("sku must be > 0"))
+	}
+	return errors.Join(errs...)
+}
+
+func CartAddItem(addFunc func(ctx context.Context, req model.AddCartItemRequest) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		x := newHelper(w, r, "CartAddItem")
+
+		if !x.checkPOSTMethod() {
+			return
+		}
+
+		token := x.getAuthToken()
+		if token == "" {
+			x.writeError(errUnauthorized)
+			return
+		}
+
+		var req cartAddItemRequest
+		if !x.decodeBodyAndValidateRequest(&req) {
+			return
+		}
+
+		if err := addFunc(x.ctx(), model.AddCartItemRequest{
+			Token:  token,
+			UserID: req.User,
+			Items:  []model.CartItem{{SKU: req.SKU, Count: req.Count}},
+		}); err != nil {
+			x.writeError(err)
+			return
+		}
+
+		x.writeResponse(http.StatusOK, struct{}{})
+	}
+}
+
+type cartDeleteItemRequest struct {
+	User model.UserID `json:"user"`
+	SKU  model.SKU    `json:"sku"`
+}
+
+func (req cartDeleteItemRequest) Validate() error {
+	var errs []error
+	if req.User <= 0 {
+		errs = append(errs, errors.New("user must be > 0"))
+	}
+	if req.SKU <= 0 {
+		errs = append(errs, errors.New("sku must be > 0"))
+	}
+	return errors.Join(errs...)
+}
+
+func CartDeleteItem(deleteFunc func(ctx context.Context, req model.DeleteCartItemRequest) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		x := newHelper(w, r, "CartDeleteItem")
+
+		if !x.checkPOSTMethod() {
+			return
+		}
+
+		var req cartDeleteItemRequest
+		if !x.decodeBodyAndValidateRequest(&req) {
+			return
+		}
+
+		if err := deleteFunc(x.ctx(), model.DeleteCartItemRequest{
+			UserID: req.User,
+			SKU:    req.SKU,
+		}); err != nil {
+			x.writeError(err)
+			return
+		}
+
+		x.writeResponse(http.StatusOK, struct{}{})
+	}
+}
+
+type userCartRequest struct {
+	User model.UserID `json:"user"`
+}
+
+func (req userCartRequest) Validate() error {
+	if req.User <= 0 {
+		return errors.New("user must be > 0")
+	}
+	return nil
+}
+
+type cartList = userCartRequest
+
+type cartListItem struct {
+	SKU   model.SKU `json:"sku"`
+	Count uint16    `json:"count"`
+	Name  string    `json:"name"`
+	Price uint32    `json:"price"`
+}
+
+type cartListResponse struct {
+	Items      []cartListItem `json:"items"`
+	TotalPrice uint32         `json:"totalPrice"`
+}
+
+func CartList(listFunc func(ctx context.Context, req model.CartListRequest) (model.CartListResponse, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		x := newHelper(w, r, "CartList")
+
+		if !x.checkPOSTMethod() {
+			return
+		}
+
+		token := x.getAuthToken()
+		if token == "" {
+			x.writeError(errUnauthorized)
+			return
+		}
+
+		var req cartList
+		if !x.decodeBodyAndValidateRequest(&req) {
+			return
+		}
+
+		cart, err := listFunc(x.ctx(), model.CartListRequest{
+			Token:  token,
+			UserID: req.User,
+		})
+		if err != nil {
+			x.writeError(err)
+			return
+		}
+
+		resp := cartListResponse{
+			Items:      make([]cartListItem, 0, len(cart.Items)),
+			TotalPrice: 0,
+		}
+		for _, item := range cart.Items {
+			resp.Items = append(resp.Items, cartListItem{
+				SKU:   item.SKU,
+				Count: item.Count,
+				Name:  item.Name,
+				Price: item.Price,
+			})
+		}
+		resp.TotalPrice = cart.TotalPrice
+
+		x.writeResponse(http.StatusOK, resp)
+	}
+}
+
+type cartClearRequest = userCartRequest
+
+func CartClear(clearFunc func(ctx context.Context, userID model.UserID) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		x := newHelper(w, r, "CartClear")
+
+		if !x.checkPOSTMethod() {
+			return
+		}
+
+		var req cartClearRequest
+		if !x.decodeBodyAndValidateRequest(&req) {
+			return
+		}
+
+		if err := clearFunc(x.ctx(), req.User); err != nil {
+			x.writeError(err)
+			return
+		}
+
+		x.writeResponse(http.StatusOK, struct{}{})
+	}
+}
+
+type cartCheckoutRequest = userCartRequest
+
+type cartCheckoutResponse struct {
+	OrderID model.OrderID `json:"orderID"`
+}
+
+func CartCheckout(checkoutFunc func(ctx context.Context, userID model.UserID) (model.OrderID, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		x := newHelper(w, r, "CartCheckout")
+
+		if !x.checkPOSTMethod() {
+			return
+		}
+
+		var req cartCheckoutRequest
+		if !x.decodeBodyAndValidateRequest(&req) {
+			return
+		}
+
+		orderID, err := checkoutFunc(x.ctx(), req.User)
+		if err != nil {
+			x.writeError(err)
+			return
+		}
+
+		x.writeResponse(http.StatusOK, cartCheckoutResponse{
+			OrderID: orderID,
+		})
+	}
+}
+
+// === cart/internal/http/handler/error.go ===
+package handler
+
+import "fmt"
+
+type httpError struct {
+	Code    int
+	Message string
+}
+
+func (e *httpError) Error() string {
+	return fmt.Sprintf("%d: %s", e.Code, e.Message)
+}
+
+var (
+	errInternalError      = &httpError{500, "internal error"}
+	errBadRequest         = &httpError{400, "bad request"}
+	errUnauthorized       = &httpError{401, "unauthorized"}
+	errNotFound           = &httpError{404, "not found"}
+	errPreconditionFailed = &httpError{412, "precondition failed"}
+)
+
+// === cart/internal/http/handler/helper.go ===
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"reflect"
+	"route256/cart/internal/model"
+	"route256/cart/pkg/http/middleware"
+)
+
+type helper struct {
+	w  http.ResponseWriter
+	r  *http.Request
+	lg *slog.Logger
+}
+
+func newHelper(w http.ResponseWriter, r *http.Request, op string) helper {
+	return helper{
+		w: w,
+		r: r,
+		lg: middleware.GetLoggerFromContextOrDefault(r.Context()).
+			With("op", "handler#"+op),
+	}
+}
+
+func (x helper) ctx() context.Context {
+	return x.r.Context()
+}
+
+func (x helper) log() *slog.Logger {
+	return x.lg
+}
+
+func (x helper) checkPOSTMethod() bool {
+	if x.r.Method != http.MethodPost {
+		x.log().Error("logical error: using for a non-POST request", "method", x.r.Method, "url", x.r.URL)
+		x.writeError(errInternalError)
+		return false
+	}
+	return true
+}
+
+func (x helper) getAuthToken() string {
+	return x.r.Header.Get("X-Authtoken")
+}
+
+func (x helper) ReadBody() ([]byte, bool) {
+	body, err := io.ReadAll(x.r.Body)
+	if err != nil {
+		x.log().Error("can't read request body", "error", err)
+		x.writeError(errInternalError)
+		return nil, false
+	}
+	return body, true
+}
+
+func (x helper) decodeBody(req any) bool {
+	body, ok := x.ReadBody()
+	if !ok {
+		return false
+	}
+	if err := json.Unmarshal(body, req); err != nil {
+		x.log().Debug("can't unmarshal request body", "error", err)
+		x.writeError(errBadRequest)
+		return false
+	}
+	return true
+}
+
+type Validator interface {
+	Validate() error
+}
+
+func (x helper) validateRequest(req any) bool {
+	if req2, ok := req.(Validator); !ok {
+		x.log().Error("request not implement Validator", "reqType", reflect.TypeOf(req))
+		x.writeError(errInternalError)
+		return false
+	} else if err := req2.Validate(); err != nil {
+		x.log().Debug("can't validate request", "error", err)
+		x.writeError(errBadRequest)
+		return false
+	}
+	return true
+}
+
+func (x helper) decodeBodyAndValidateRequest(req any) bool {
+	return x.decodeBody(req) && x.validateRequest(req)
+}
+
+func (x helper) writeResponse(status int, resp any) {
+	jsonData, err := json.Marshal(resp)
+	if err != nil {
+		x.log().Error("can't marshal response", "error", err)
+		x.writeError(errInternalError)
+		return
+	}
+
+	x.w.Header().Add("content-type", "application/json")
+	x.w.WriteHeader(status)
+
+	if _, err := x.w.Write(jsonData); err != nil {
+		x.log().Error("can't write response", "error", err)
+		return
+	}
+}
+
+func (x helper) writeError(err error) {
+	var httpErr *httpError
+	switch {
+	case errors.As(err, &httpErr):
+	case errors.Is(err, model.ErrUnauthorized):
+		httpErr = errUnauthorized
+	case errors.Is(err, model.ErrNotFound):
+		httpErr = errNotFound
+	case errors.Is(err, model.ErrPreconditionFailed):
+		httpErr = errPreconditionFailed
+	case errors.Is(err, model.ErrInternalError):
+		httpErr = errInternalError
+	default:
+		x.log().Warn("unhandled error", "error", err)
+		httpErr = errInternalError
+	}
+	http.Error(x.w, httpErr.Message, httpErr.Code)
+}
+
+// === cart/internal/memstor/cart.go ===
+package memstor
+
+import (
+	"context"
+	"route256/cart/internal/model"
+	"route256/cart/internal/service"
+	"slices"
+	"sync"
+)
+
+type Cart struct {
+	mu    sync.RWMutex
+	carts map[model.UserID][]model.CartItem
+}
+
+func NewCart() *Cart {
+	return &Cart{
+		carts: map[model.UserID][]model.CartItem{},
+	}
+}
+
+func (p *Cart) Add(_ context.Context, req model.AddCartItemRequest) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	cart := p.carts[req.UserID]
+
+reqItemsLoop:
+	for _, reqItem := range req.Items {
+		for i := range cart {
+			item := &cart[i]
+			if item.SKU == reqItem.SKU {
+				item.Count += reqItem.Count
+				continue reqItemsLoop
+			}
+		}
+		cart = append(cart, model.CartItem{SKU: reqItem.SKU, Count: reqItem.Count})
+	}
+
+	p.carts[req.UserID] = cart
+	return nil
+}
+
+func (p *Cart) Delete(_ context.Context, req model.DeleteCartItemRequest) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	cart := p.carts[req.UserID]
+	for i := range cart {
+		item := &cart[i]
+		if item.SKU == req.SKU {
+			n := len(cart)
+			cart[i] = cart[n-1]
+			cart = cart[:n-1]
+			p.carts[req.UserID] = cart
+			return nil
+		}
+	}
+
+	return model.ErrNotFound
+}
+
+func (p *Cart) List(_ context.Context, userID model.UserID) ([]model.CartItem, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	cart := p.carts[userID]
+	if cart == nil {
+		return nil, model.ErrNotFound
+	}
+
+	return slices.Clone(cart), nil
+}
+
+func (p *Cart) Clear(_ context.Context, userID model.UserID) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	delete(p.carts, userID)
+	return nil
+}
+
+var _ service.CartStorage = &Cart{}
+
+// === cart/internal/model/dto.go ===
+package model
+
+type AddCartItemRequest struct {
+	Token  string
+	UserID UserID
+	Items  []CartItem
+}
+
+type DeleteCartItemRequest struct {
+	UserID UserID
+	SKU    SKU
+}
+
+type GetProductRequest struct {
+	Token string
+	SKU   SKU
+}
+
+type GetProductResponse struct {
+	Name  string
+	Price uint32
+}
+
+type CartListItem struct {
+	SKU   SKU
+	Count uint16
+	Name  string
+	Price uint32
+}
+
+type CartListRequest struct {
+	UserID UserID
+	Token  string
+}
+
+type CartListResponse struct {
+	Items      []CartListItem
+	TotalPrice uint32
+}
+
+type OrderItem = CartItem
+
+type OrderCreateRequest struct {
+	UserID UserID
+	Items  []OrderItem
+}
+
+// === cart/internal/model/error.go ===
+package model
+
+import "errors"
+
+var (
+	ErrInternalError      = errors.New("internal error")
+	ErrUnauthorized       = errors.New("unauthorized")
+	ErrNotFound           = errors.New("not found")
+	ErrPreconditionFailed = errors.New("precondition failed")
+)
+
+// === cart/internal/model/model.go ===
+package model
+
+type (
+	SKU     int32
+	UserID  int64
+	OrderID int64
+)
+
+type Cart struct {
+	UserID UserID
+	Items  []CartItem
+}
+
+type CartItem struct {
+	SKU   SKU
+	Count uint16
+}
+
+// === cart/internal/repo/cart/atapter.go ===
+package cart
+
+import (
+	"context"
+	"route256/cart/internal/model"
+	"route256/cart/internal/service"
+)
+
+type Adapter struct {
+	*Queries
+}
+
+func NewQueriesAdapter(q *Queries) Adapter {
+	return Adapter{q}
+}
+
+// Add implements service.CartStorage.
+func (a Adapter) Add(ctx context.Context, req model.AddCartItemRequest) error {
+	n := len(req.Items)
+	user_ids := make([]int64, 0, n)
+	skus := make([]int32, 0, n)
+	counts := make([]int32, 0, n)
+	for _, item := range req.Items {
+		user_ids = append(user_ids, int64(req.UserID))
+		skus = append(skus, int32(item.SKU))
+		counts = append(counts, int32(item.Count))
+	}
+	return a.Queries.AddArrays(ctx, AddArraysParams{
+		Column1: user_ids,
+		Column2: skus,
+		Column3: counts,
+	})
+}
+
+// Clear implements service.CartStorage.
+func (a Adapter) Clear(ctx context.Context, userID model.UserID) error {
+	return a.Queries.Clear(ctx, int64(userID))
+}
+
+// Delete implements service.CartStorage.
+func (a Adapter) Delete(ctx context.Context, req model.DeleteCartItemRequest) error {
+	return a.Queries.Delete(ctx, DeleteParams{
+		UserID: int64(req.UserID),
+		Sku:    int32(req.SKU),
+	})
+}
+
+// List implements service.CartStorage.
+func (a Adapter) List(ctx context.Context, userID model.UserID) ([]model.CartItem, error) {
+	list, err := a.Queries.List(ctx, int64(userID))
+	if err != nil {
+		return nil, err
+	}
+	items := make([]model.CartItem, 0, len(list))
+	for _, item := range list {
+		items = append(items, model.CartItem{
+			SKU:   model.SKU(item.Sku),
+			Count: uint16(item.Count),
+		})
+	}
+	return items, nil
+}
+
+var _ service.CartStorage = Adapter{}
+
+// === cart/internal/repo/cart/batch.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+// source: batch.go
+
+package cart
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+)
+
+var (
+	ErrBatchAlreadyClosed = errors.New("batch already closed")
+)
+
+const addBatch = `-- name: AddBatch :batchexec
+INSERT INTO cart (user_id, sku, count) VALUES ($1, $2, $3)
+ON CONFLICT (user_id, sku) DO UPDATE set count = count + $3
+`
+
+type AddBatchBatchResults struct {
+	br     pgx.BatchResults
+	tot    int
+	closed bool
+}
+
+type AddBatchParams struct {
+	UserID int64 `json:"user_id"`
+	Sku    int32 `json:"sku"`
+	Count  int32 `json:"count"`
+}
+
+func (q *Queries) AddBatch(ctx context.Context, arg []AddBatchParams) *AddBatchBatchResults {
+	batch := &pgx.Batch{}
+	for _, a := range arg {
+		vals := []interface{}{
+			a.UserID,
+			a.Sku,
+			a.Count,
+		}
+		batch.Queue(addBatch, vals...)
+	}
+	br := q.db.SendBatch(ctx, batch)
+	return &AddBatchBatchResults{br, len(arg), false}
+}
+
+func (b *AddBatchBatchResults) Exec(f func(int, error)) {
+	defer b.br.Close()
+	for t := 0; t < b.tot; t++ {
+		if b.closed {
+			if f != nil {
+				f(t, ErrBatchAlreadyClosed)
+			}
+			continue
+		}
+		_, err := b.br.Exec()
+		if f != nil {
+			f(t, err)
+		}
+	}
+}
+
+func (b *AddBatchBatchResults) Close() error {
+	b.closed = true
+	return b.br.Close()
+}
+
+// === cart/internal/repo/cart/db.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package cart
+
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+type DBTX interface {
+	Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...interface{}) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...interface{}) pgx.Row
+	SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
+}
+
+func New(db DBTX) *Queries {
+	return &Queries{db: db}
+}
+
+type Queries struct {
+	db DBTX
+}
+
+func (q *Queries) WithTx(tx pgx.Tx) *Queries {
+	return &Queries{
+		db: tx,
+	}
+}
+
+// === cart/internal/repo/cart/models.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package cart
+
+type Cart struct {
+	UserID int64 `json:"user_id"`
+	Sku    int32 `json:"sku"`
+	Count  int32 `json:"count"`
+}
+
+// === cart/internal/repo/cart/querier.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package cart
+
+import (
+	"context"
+)
+
+type Querier interface {
+	AddArrays(ctx context.Context, arg AddArraysParams) error
+	AddBatch(ctx context.Context, arg []AddBatchParams) *AddBatchBatchResults
+	Clear(ctx context.Context, userID int64) error
+	Delete(ctx context.Context, arg DeleteParams) error
+	List(ctx context.Context, userID int64) ([]Cart, error)
+}
+
+var _ Querier = (*Queries)(nil)
+
+// === cart/internal/repo/cart/queries.sql.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+// source: queries.sql
+
+package cart
+
+import (
+	"context"
+)
+
+const addArrays = `-- name: AddArrays :exec
+INSERT INTO cart (user_id, sku, count)
+SELECT 
+    UNNEST($1::bigint[]) AS user_id,
+    UNNEST($2::int[]   ) AS sku,
+    UNNEST($3::int[]   ) AS count    
+ON CONFLICT (user_id, sku) 
+DO UPDATE SET count = cart.count + EXCLUDED.count
+`
+
+type AddArraysParams struct {
+	Column1 []int64 `json:"column_1"`
+	Column2 []int32 `json:"column_2"`
+	Column3 []int32 `json:"column_3"`
+}
+
+func (q *Queries) AddArrays(ctx context.Context, arg AddArraysParams) error {
+	_, err := q.db.Exec(ctx, addArrays, arg.Column1, arg.Column2, arg.Column3)
+	return err
+}
+
+const clear = `-- name: Clear :exec
+DELETE FROM cart WHERE user_id = $1
+`
+
+func (q *Queries) Clear(ctx context.Context, userID int64) error {
+	_, err := q.db.Exec(ctx, clear, userID)
+	return err
+}
+
+const delete = `-- name: Delete :exec
+DELETE FROM cart WHERE user_id = $1 AND sku = $2
+`
+
+type DeleteParams struct {
+	UserID int64 `json:"user_id"`
+	Sku    int32 `json:"sku"`
+}
+
+func (q *Queries) Delete(ctx context.Context, arg DeleteParams) error {
+	_, err := q.db.Exec(ctx, delete, arg.UserID, arg.Sku)
+	return err
+}
+
+const list = `-- name: List :many
+SELECT user_id, sku, count FROM cart WHERE user_id = $1
+`
+
+func (q *Queries) List(ctx context.Context, userID int64) ([]Cart, error) {
+	rows, err := q.db.Query(ctx, list, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Cart
+	for rows.Next() {
+		var i Cart
+		if err := rows.Scan(&i.UserID, &i.Sku, &i.Count); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// === cart/internal/service/cart.go ===
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"route256/cart/internal/model"
+)
+
+type CartStorage interface {
+	Add(ctx context.Context, req model.AddCartItemRequest) error
+	Delete(ctx context.Context, req model.DeleteCartItemRequest) error
+	List(ctx context.Context, userID model.UserID) ([]model.CartItem, error)
+	Clear(ctx context.Context, userID model.UserID) error
+}
+
+type OrderStorage interface {
+	CreateOrder(ctx context.Context, req model.OrderCreateRequest) (model.OrderID, error)
+	GetStockInfo(ctx context.Context, sku model.SKU) (count uint64, err error)
+}
+
+type ProductStorage interface {
+	GetInfo(ctx context.Context, req model.GetProductRequest) (model.GetProductResponse, error)
+}
+
+type Cart struct {
+	cart    CartStorage
+	order   OrderStorage
+	product ProductStorage
+}
+
+func NewCart(cart CartStorage, order OrderStorage, product ProductStorage) *Cart {
+	return &Cart{
+		cart:    cart,
+		order:   order,
+		product: product,
+	}
+}
+
+func (p *Cart) Add(ctx context.Context, req model.AddCartItemRequest) error {
+	countInCart, err := p.getCountInCart(ctx, req.UserID)
+	if err != nil {
+		return err
+	}
+	sreq := model.AddCartItemRequest{
+		UserID: req.UserID,
+		Items:  make([]model.CartItem, 0, len(req.Items)),
+	}
+	for _, item := range req.Items {
+		if item.Count == 0 {
+			// Игнорируем нулевые количества
+			continue
+		}
+
+		exists, err := p.isProductExists(ctx, req.Token, item.SKU)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return model.ErrPreconditionFailed
+		}
+
+		count, err := p.getCountInStock(ctx, item.SKU)
+		if err != nil {
+			return err
+		}
+		if count < uint64(item.Count+countInCart[item.SKU]) {
+			return model.ErrPreconditionFailed
+		}
+
+		sreq.Items = append(sreq.Items, item)
+	}
+	return p.cart.Add(ctx, sreq)
+}
+
+func (p *Cart) getCountInCart(ctx context.Context, userID model.UserID) (map[model.SKU]uint16, error) {
+	cartItems, err := p.cart.List(ctx, userID)
+	if err != nil && !errors.Is(err, model.ErrNotFound) {
+		return nil, fmt.Errorf("failed to list cart items: %w", err)
+	}
+	countInCart := make(map[model.SKU]uint16, len(cartItems))
+	for _, item := range cartItems {
+		countInCart[item.SKU] = item.Count
+	}
+	return countInCart, nil
+}
+
+func (p *Cart) isProductExists(ctx context.Context, token string, sku model.SKU) (bool, error) {
+	_, err := p.product.GetInfo(ctx, model.GetProductRequest{
+		Token: token,
+		SKU:   sku,
+	})
+	if errors.Is(err, model.ErrNotFound) {
+		// Товар не найден в каталоге, но здесь это не ошибка
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to get product info: %w", err)
+	}
+	return true, nil
+}
+
+func (p *Cart) getCountInStock(ctx context.Context, sku model.SKU) (count uint64, _ error) {
+	count, err := p.order.GetStockInfo(ctx, sku)
+	if errors.Is(err, model.ErrNotFound) {
+		// Если товар не найден на складе, считаем его количество равным 0
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("failed to get product in stock info: %w", err)
+	}
+	return count, nil
+}
+
+func (p *Cart) Delete(ctx context.Context, req model.DeleteCartItemRequest) error {
+	err := p.cart.Delete(ctx, req)
+	if errors.Is(err, model.ErrNotFound) {
+		// Если товара нет в корзине, не возвращаем ошибку, чтобы обеспечить идемпотентность
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to delete item from cart: %w", err)
+	}
+	return nil
+}
+
+func (p *Cart) List(ctx context.Context, req model.CartListRequest) (resp model.CartListResponse, _ error) {
+	log := getLogger(ctx, "Cart.List")
+
+	// Инициализируем список товаров в корзине, чтобы не вернуть nil
+	resp.Items = []model.CartListItem{}
+
+	cartItems, err := p.cart.List(ctx, req.UserID)
+	if errors.Is(err, model.ErrNotFound) {
+		return resp, nil
+	}
+	if err != nil {
+		return resp, fmt.Errorf("failed to list cart items: %w", err)
+	}
+
+	var skusToDelete []model.SKU
+	for _, item := range cartItems {
+		if item.Count == 0 {
+			// Товара нет в корзине
+			log.Warn("no product in cart, it will be deleted", "SKU", item.SKU)
+			skusToDelete = append(skusToDelete, item.SKU)
+			continue
+		}
+		product, err := p.product.GetInfo(ctx, model.GetProductRequest{
+			Token: req.Token,
+			SKU:   item.SKU,
+		})
+		if errors.Is(err, model.ErrNotFound) {
+			// Товар не найден в каталоге, добавляем в список на удаление
+			log.Warn("cart item not found in products, it will be deleted", "SKU", item.SKU)
+			skusToDelete = append(skusToDelete, item.SKU)
+			continue
+		}
+		if err != nil {
+			return resp, fmt.Errorf("failed to get product info: %w", err)
+		}
+
+		// Добавляем товар в ответ
+		resp.Items = append(resp.Items, model.CartListItem{
+			SKU:   item.SKU,
+			Count: item.Count,
+			Name:  product.Name,
+			Price: product.Price,
+		})
+		resp.TotalPrice += product.Price * uint32(item.Count)
+	}
+
+	// Удаляем несуществующие товары из корзины
+	for _, sku := range skusToDelete {
+		if err := p.cart.Delete(ctx, model.DeleteCartItemRequest{
+			UserID: req.UserID,
+			SKU:    sku,
+		}); err != nil {
+			return resp, fmt.Errorf("failed to delete invalid cart item: %w", err)
+		}
+	}
+
+	return resp, nil
+}
+
+func (p *Cart) Clear(ctx context.Context, userID model.UserID) error {
+	return p.cart.Clear(ctx, userID)
+}
+
+func (p *Cart) Checkout(ctx context.Context, userID model.UserID) (model.OrderID, error) {
+	log := getLogger(ctx, "Cart.Checkout")
+
+	cartItems, err := p.cart.List(ctx, userID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to list cart items: %w", err)
+	}
+	if len(cartItems) == 0 {
+		return 0, fmt.Errorf("cart is empty: %w", model.ErrNotFound)
+	}
+
+	orderID, err := p.order.CreateOrder(ctx, model.OrderCreateRequest{
+		UserID: userID,
+		Items:  cartItems,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("failed to create order: %w", err)
+	}
+
+	if err := p.cart.Clear(ctx, userID); err != nil {
+		// Логируем ошибку очистки корзины, но не прерываем выполнение
+		log.Error("failed to clear cart after checkout", "error", err)
+	}
+
+	return orderID, nil
+}
+
+// === cart/internal/service/logger.go ===
+package service
+
+import (
+	"context"
+	"log/slog"
+	"route256/cart/pkg/http/middleware"
+)
+
+func getLogger(ctx context.Context, op string) *slog.Logger {
+	return middleware.GetLoggerFromContextOrDefault(ctx).
+		With("op", "service#"+op)
+}
+
+// === cart/pkg/http/middleware/logging.go ===
+package middleware
+
+import (
+	"cmp"
+	"context"
+	"log/slog"
+	"math/rand/v2"
+	"net/http"
+	"runtime/debug"
+	"sync/atomic"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+type loggerContextKey struct{}
+
+// ContextWithLogger добавляет логгер в контекст.
+func ContextWithLogger(ctx context.Context, log *slog.Logger) context.Context {
+	return context.WithValue(ctx, loggerContextKey{}, log)
+}
+
+// GetLoggerFromContext возвращает логгер из контекста или nil, если логгер не найден.
+func GetLoggerFromContext(ctx context.Context) *slog.Logger {
+	if v := ctx.Value(loggerContextKey{}); v != nil {
+		return v.(*slog.Logger)
+	}
+	return nil
+}
+
+// GetLoggerFromContextOrDefault возвращает логгер из контекста или логгер по умолчанию,
+// если логгер не найден.
+func GetLoggerFromContextOrDefault(ctx context.Context) *slog.Logger {
+	return cmp.Or(GetLoggerFromContext(ctx), slog.Default())
+}
+
+// Logging создает middleware для логирования HTTP-запросов.
+func Logging(log *slog.Logger, h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log := log.With("httpReqID", rand.Uint64())
+
+		url := r.URL.String()
+		log.Debug("http request begin", "fromAddr", r.RemoteAddr, "method", r.Method, "url", url)
+
+		w = newWriteHeaderHook(w, func(statusCode int) {
+			log.Debug("http request end", "statusCode", statusCode, "url", url)
+		})
+
+		ctx := ContextWithLogger(r.Context(), log)
+		r = r.WithContext(ctx)
+
+		defer func() {
+			if p := recover(); p != nil {
+				log.Error("*** panic recovered ***", "panic", p, "stack", debug.Stack())
+				http.Error(w, "internal error", 500)
+			}
+		}()
+
+		h.ServeHTTP(w, r)
+	})
+}
+
+type writeHeaderHook struct {
+	http.ResponseWriter
+	hook func(statusCode int)
+	flag atomic.Bool
+}
+
+func newWriteHeaderHook(w http.ResponseWriter, hook func(statusCode int)) *writeHeaderHook {
+	return &writeHeaderHook{
+		ResponseWriter: w,
+		hook:           hook,
+	}
+}
+
+func (hk *writeHeaderHook) WriteHeader(statusCode int) {
+	if !hk.flag.Swap(true) {
+		hk.hook(statusCode)
+		hk.ResponseWriter.WriteHeader(statusCode)
+	}
+}
+
+func (hk *writeHeaderHook) Write(b []byte) (int, error) {
+	hk.WriteHeader(http.StatusOK)
+	return hk.ResponseWriter.Write(b)
+}
+
+func GRPCLogging(log *slog.Logger) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (_ interface{}, err error) {
+		log := log.With("grpcReqID", rand.Uint64())
+		log.Debug("grpc request begin", "fromAddr", "???", "method", info.FullMethod, "req", req)
+
+		defer func() {
+			if p := recover(); p != nil {
+				log.Error("*** panic recovered ***", "panic", p, "stack", debug.Stack())
+				err = status.Error(codes.Internal, "internal error")
+			}
+		}()
+
+		resp, err := handler(ContextWithLogger(ctx, log), req)
+		log.Debug("grpc request end", "status", status.Code(err), "resp", resp)
+
+		return resp, err
+	}
+}
+
+// === loms/cmd/app/main.go ===
+package main
+
+import (
+	"os"
+	"route256/loms/internal/app"
+)
+
+func main() {
+	os.Exit(app.Run())
+}
+
+// === loms/internal/app/app.go ===
+package app
+
+import (
+	"context"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"route256/cart/pkg/http/middleware"
+	"route256/loms/internal/config"
+	grpcHandler "route256/loms/internal/grpc/handler"
+	httpHandler "route256/loms/internal/http/handler"
+	_ "route256/loms/internal/memstor"
+	orderRepo "route256/loms/internal/repo/order"
+	stockRepo "route256/loms/internal/repo/stock"
+	"route256/loms/internal/service"
+	"route256/loms/pkg/api/order/v1"
+	"route256/loms/pkg/api/stock/v1"
+	"sync"
+	"syscall"
+
+	"google.golang.org/grpc"
+)
+
+func Run() int {
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Error("can't load config", "error", err)
+		return 1
+	}
+
+	setupDefaultLogger(cfg.Logger)
+
+	dbpool, err := openDB(context.TODO(), cfg.DB)
+	if err != nil {
+		slog.Error("can't open database", "error", err)
+		return 1
+	}
+
+	orderStor := orderRepo.Adapter{Queries: orderRepo.New(dbpool)}
+	stockStor := stockRepo.Adapter{Queries: stockRepo.New(dbpool)}
+
+	lomsService := service.NewLOMS(
+		orderStor,
+		stockStor,
+	)
+
+	// Создаем менеджер и добавляем серверы
+	manager := &serverManager{}
+	manager.AddServer(newHTTPServer(cfg.HTTPServer, lomsService))
+	manager.AddServer(newGRPCServer(cfg.GRPCServer, lomsService))
+
+	// Запускаем серверы
+	manager.StartAll()
+
+	// Ожидаем сигнала или падения серверов
+	manager.WaitForShutdown()
+
+	// Завершаем работу серверов
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancel()
+	manager.StopAll(ctx)
+
+	if manager.failed {
+		return 1
+	}
+
+	return 0
+}
+
+func setupDefaultLogger(cfg *config.Logger) {
+	var handler slog.Handler
+	if cfg.PlainText {
+		handler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.Level})
+	} else {
+		handler = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.Level})
+	}
+	slog.SetDefault(slog.New(handler).With("app", "loms"))
+}
+
+// server представляет интерфейс для управления сервером.
+type server interface {
+	Start(fail chan<- struct{}) // Запуск сервера
+	Stop(ctx context.Context)   // Остановка сервера
+}
+
+// serverManager управляет несколькими серверами.
+type serverManager struct {
+	servers []server
+	fail    chan struct{}
+	failed  bool
+	once    sync.Once
+}
+
+// AddServer добавляет сервер в менеджер.
+func (m *serverManager) AddServer(server server) {
+	m.servers = append(m.servers, server)
+}
+
+// StartAll запускает все серверы.
+func (m *serverManager) StartAll() {
+	m.once.Do(func() {
+		m.fail = make(chan struct{}, len(m.servers))
+		for _, svr := range m.servers {
+			go svr.Start(m.fail)
+		}
+	})
+}
+
+// StopAll останавливает все серверы.
+func (m *serverManager) StopAll(ctx context.Context) {
+	var wg sync.WaitGroup
+	for _, svr := range m.servers {
+		wg.Add(1)
+		go func(s server) {
+			defer wg.Done()
+			s.Stop(ctx)
+		}(svr)
+	}
+	wg.Wait()
+}
+
+// WaitForShutdown ожидает сигнала завершения или падения серверов.
+func (m *serverManager) WaitForShutdown() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case <-c:
+		slog.Info("shutdown by signal")
+	case <-m.fail:
+		slog.Info("shutdown by server failure")
+		m.failed = true
+	}
+}
+
+type httpServer struct {
+	server *http.Server
+}
+
+func newHTTPServer(cfg *config.HTTPServer, lomsService *service.LOMS) *httpServer {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /ping", pong)
+	mux.Handle("POST /order/create", httpHandler.CreateOrder(lomsService.CreateOrder))
+	mux.Handle("POST /order/info", httpHandler.GetOrderInfo(lomsService.GetOrderInfo))
+	mux.Handle("POST /order/pay", httpHandler.PayOrder(lomsService.PayOrder))
+	mux.Handle("POST /order/cancel", httpHandler.CancelOrder(lomsService.CancelOrder))
+	mux.Handle("POST /stock/info", httpHandler.GetStockInfo(lomsService.GetStockInfo))
+
+	return &httpServer{
+		server: &http.Server{
+			Addr:         cfg.Addr,
+			Handler:      middleware.Logging(slog.Default(), mux),
+			ReadTimeout:  cfg.ReadTimeout,
+			WriteTimeout: cfg.WriteTimeout,
+		},
+	}
+}
+
+func pong(w http.ResponseWriter, h *http.Request) {
+	if _, err := w.Write([]byte("pong")); err != nil {
+		slog.Error("ping: can't write pong", "error", err)
+	}
+}
+
+func (s *httpServer) Start(fail chan<- struct{}) {
+	slog.Info("http server startup", "addr", s.server.Addr)
+	if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		slog.Error("http server failed", "error", err)
+		fail <- struct{}{} // Отправляем сигнал о падении
+	}
+}
+
+func (s *httpServer) Stop(ctx context.Context) {
+	if err := s.server.Shutdown(ctx); err != nil {
+		slog.Error("failed to stop http server", "error", err)
+	}
+}
+
+type grpcServer struct {
+	server *grpc.Server
+	cfg    *config.GRPCServer
+}
+
+func newGRPCServer(cfg *config.GRPCServer, lomsService *service.LOMS) *grpcServer {
+	server := grpc.NewServer(grpc.UnaryInterceptor(middleware.GRPCLogging(slog.Default())))
+	order.RegisterOrderServer(server, grpcHandler.NewOrder(lomsService))
+	stock.RegisterStockServer(server, grpcHandler.NewStock(lomsService))
+
+	return &grpcServer{
+		server: server,
+		cfg:    cfg,
+	}
+}
+
+func (s *grpcServer) Start(fail chan<- struct{}) {
+	slog.Info("grcp server startup", "addr", s.cfg.Addr)
+	lis, err := net.Listen("tcp", s.cfg.Addr)
+	if err != nil {
+		slog.Error("grpc server failed", "error", err)
+		fail <- struct{}{} // Отправляем сигнал о падении
+		return
+	}
+	if err := s.server.Serve(lis); err != nil {
+		slog.Error("grpc server failed", "error", err)
+		fail <- struct{}{} // Отправляем сигнал о падении
+	}
+}
+
+func (s *grpcServer) Stop(ctx context.Context) {
+	stopped := make(chan struct{})
+	go func() {
+		s.server.GracefulStop()
+		close(stopped)
+	}()
+	select {
+	case <-ctx.Done():
+		s.server.Stop()
+	case <-stopped:
+	}
+}
+
+// === loms/internal/app/opendb.go ===
+package app
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/url"
+	"reflect"
+	"route256/loms/internal/config"
+	"slices"
+	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func getDBConnectString(cfg *config.DB) string {
+	q := url.Values{}
+	if cfg.SSLMode != "" {
+		q.Set("sslmode", cfg.SSLMode)
+	}
+	u := url.URL{
+		Scheme:   "postgres",
+		Host:     cfg.Addr,
+		User:     url.UserPassword(cfg.User, cfg.Password),
+		Path:     cfg.Name,
+		RawQuery: q.Encode(),
+	}
+	return u.String()
+}
+
+func waitDBUp(ctx context.Context, dbpool *pgxpool.Pool) error {
+	const (
+		initialBackoff = 1 * time.Second
+		maxBackoff     = 10 * time.Second
+	)
+
+	var timer *time.Timer
+	backoff := initialBackoff
+
+	for {
+		// Выполняем проверку подключения
+		err := dbpool.Ping(ctx)
+		if err == nil {
+			return nil
+		}
+		if !isRetryableError(err) {
+			return fmt.Errorf("non-retryable error: %w", err)
+		}
+
+		slog.Debug("connection will be retry", "error", err, "backoff", backoff)
+		if timer == nil {
+			timer = time.NewTimer(backoff)
+		} else {
+			timer.Reset(backoff)
+		}
+
+		// Ждем следующей попытки или завершения контекста
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			// Экспоненциальный рост с ограничением
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
+func openDB(ctx context.Context, cfg *config.DB) (_ *pgxpool.Pool, err error) {
+	dsn := getDBConnectString(cfg)
+
+	dbpool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("create pool: %w", err)
+	}
+
+	defer func() {
+		if err != nil {
+			dbpool.Close()
+		}
+	}()
+
+	if cfg.WaitUpTimeout > 0 {
+		waitCtx, cancel := context.WithTimeout(ctx, cfg.WaitUpTimeout)
+		defer cancel()
+
+		waitErr := waitDBUp(waitCtx, dbpool)
+		if waitErr == nil {
+			return dbpool, nil
+		}
+
+		if !errors.Is(waitErr, context.DeadlineExceeded) || ctx.Err() != nil {
+			return nil, fmt.Errorf("wait for DB failed: %w", waitErr)
+		}
+
+		slog.Debug("wait timeout exceeded, performing final ping")
+	}
+
+	if err := dbpool.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("initial ping failed: %w", err)
+	}
+
+	return dbpool, nil
+}
+
+func isRetryableError(err error) bool {
+	// Если контекст завершен, не повторяем
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+
+	// Сетевые ошибки
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() || errors.Is(netErr, syscall.ECONNREFUSED) {
+			return true
+		}
+		return false
+	}
+
+	// Ошибки PostgreSQL
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		// Список фатальных ошибок из официальной документации:
+		// https://www.postgresql.org/docs/current/errcodes-appendix.html
+		fatalCodes := []string{
+			"28P01", // Invalid password
+			"3D000", // Database does not exist
+			"42501", // Insufficient privilege
+			"42601", // Syntax error
+			"42703", // Undefined column
+			"42P01", // Undefined table
+		}
+		return !slices.Contains(fatalCodes, pgErr.Code)
+	}
+
+	// По умолчанию считаем ошибку повторимой
+	slog.Debug("isRetryableError: unknown error", "error", err, "errorType", reflect.TypeOf(err))
+	return true
+}
+
+// === loms/internal/app/pong.go ===
+package app
+
+// === loms/internal/app/producs.go ===
+package app
+
+import "route256/loms/internal/model"
+
+var productsForTest = []model.SKU{
+	1076963,
+	1148162,
+	1625903,
+	2618151,
+	2956315,
+	2958025,
+	3596599,
+	3618852,
+	4288068,
+	4465995,
+}
+
+var _ = productsForTest
+
+// === loms/internal/config/config.go ===
+package config
+
+import (
+	"log/slog"
+	"os"
+	"time"
+)
+
+type Logger struct {
+	Level     slog.Level
+	PlainText bool
+}
+
+type HTTPServer struct {
+	Addr         string
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+}
+
+type GRPCServer struct {
+	Addr string
+}
+
+type DB struct {
+	Addr          string
+	Name          string
+	User          string
+	Password      string
+	SSLMode       string
+	WaitUpTimeout time.Duration
+}
+
+type Config struct {
+	ShutdownTimeout time.Duration
+	Logger          *Logger
+	HTTPServer      *HTTPServer
+	GRPCServer      *GRPCServer
+	DB              *DB
+}
+
+func Load() (Config, error) {
+	return Config{
+		ShutdownTimeout: 30 * time.Second,
+		Logger: &Logger{
+			Level:     slog.LevelDebug,
+			PlainText: true,
+		},
+		HTTPServer: &HTTPServer{
+			Addr:         ":8080",
+			ReadTimeout:  10 * time.Second,
+			WriteTimeout: 10 * time.Second,
+		},
+		GRPCServer: &GRPCServer{
+			Addr: ":50051",
+		},
+		DB: &DB{
+			Addr:          "db",
+			Name:          "loms",
+			User:          "loms",
+			Password:      os.Getenv("DB_PASSWORD"),
+			SSLMode:       "disable",
+			WaitUpTimeout: 30 * time.Second,
+		},
+	}, nil
+}
+
+// === loms/internal/grpc/handler/maperr.go ===
+package handler
+
+import (
+	"context"
+	"errors"
+	"route256/cart/pkg/http/middleware"
+	"route256/loms/internal/model"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+func mapError(ctx context.Context, err error) error {
+	switch {
+	case errors.Is(err, model.ErrNotFound):
+		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, model.ErrPreconditionFailed):
+		return status.Error(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, model.ErrInternalError):
+		return status.Error(codes.Internal, err.Error())
+	}
+	log := middleware.GetLoggerFromContextOrDefault(ctx)
+	log.Warn("unhandled error", "error", err)
+	return status.Error(codes.Internal, model.ErrInternalError.Error())
+}
+
+// === loms/internal/grpc/handler/order.go ===
+package handler
+
+import (
+	"context"
+	"route256/loms/internal/model"
+	"route256/loms/pkg/api/order/v1"
+)
+
+type LomsService interface {
+	CreateOrder(ctx context.Context, req model.CreateOrderRequest) (orderID model.OrderID, err error)
+	GetOrderInfo(ctx context.Context, orderID model.OrderID) (resp model.Order, err error)
+	PayOrder(ctx context.Context, orderID model.OrderID) error
+	CancelOrder(ctx context.Context, orderID model.OrderID) error
+	GetStockInfo(ctx context.Context, sku model.SKU) (count uint64, err error)
+}
+
+type Order struct {
+	order.UnimplementedOrderServer
+	service LomsService
+}
+
+func NewOrder(service LomsService) *Order {
+	return &Order{service: service}
+}
+
+func (o Order) Create(ctx context.Context, req *order.CreateRequest) (*order.CreateResponse, error) {
+	mreq := model.CreateOrderRequest{
+		UserID: model.UserID(req.User),
+		Items:  make([]model.OrderItem, 0, len(req.Items)),
+	}
+	for _, item := range req.Items {
+		mreq.Items = append(mreq.Items, model.OrderItem{
+			SKU:   model.SKU(item.Sku),
+			Count: int(item.Count),
+		})
+	}
+	orderID, err := o.service.CreateOrder(ctx, mreq)
+	if err != nil {
+		return nil, mapError(ctx, err)
+	}
+	return &order.CreateResponse{OrderID: int64(orderID)}, nil
+}
+
+func (o Order) GetInfo(ctx context.Context, req *order.GetInfoRequest) (*order.GetInfoResponse, error) {
+	mresp, err := o.service.GetOrderInfo(ctx, model.OrderID(req.OrderID))
+	if err != nil {
+		return nil, mapError(ctx, err)
+	}
+
+	resp := &order.GetInfoResponse{
+		Status: order.OrderStatus(mresp.Status),
+		User:   int64(mresp.UserID),
+		Items:  make([]*order.Item, 0, len(mresp.Items)),
+	}
+	for _, item := range mresp.Items {
+		resp.Items = append(resp.Items, &order.Item{
+			Sku:   int32(item.SKU),
+			Count: uint32(item.Count),
+		})
+	}
+
+	return resp, nil
+}
+
+func (o Order) Pay(ctx context.Context, req *order.PayRequest) (*order.PayResponse, error) {
+	if err := o.service.PayOrder(ctx, model.OrderID(req.OrderID)); err != nil {
+		return nil, mapError(ctx, err)
+	}
+	return &order.PayResponse{}, nil
+}
+
+func (o Order) Cancel(ctx context.Context, req *order.CancelRequest) (*order.CancelResponse, error) {
+	if err := o.service.CancelOrder(ctx, model.OrderID(req.OrderID)); err != nil {
+		return nil, mapError(ctx, err)
+	}
+	return &order.CancelResponse{}, nil
+}
+
+// === loms/internal/grpc/handler/stock.go ===
+package handler
+
+import (
+	"context"
+	"route256/loms/internal/model"
+	"route256/loms/pkg/api/stock/v1"
+)
+
+type StockService interface {
+	GetStockInfo(ctx context.Context, sku model.SKU) (count uint64, err error)
+}
+
+type Stock struct {
+	stock.UnimplementedStockServer
+	service StockService
+}
+
+func NewStock(service StockService) *Stock {
+	return &Stock{service: service}
+}
+
+func (s Stock) GetInfo(ctx context.Context, req *stock.GetInfoRequest) (*stock.GetInfoResponse, error) {
+	count, err := s.service.GetStockInfo(ctx, model.SKU(req.Sku))
+	if err != nil {
+		return nil, mapError(ctx, err)
+	}
+	return &stock.GetInfoResponse{Count: count}, nil
+}
+
+// === loms/internal/http/handler/error.go ===
+package handler
+
+import "fmt"
+
+type httpError struct {
+	Code    int
+	Message string
+}
+
+func (e *httpError) Error() string {
+	return fmt.Sprintf("%d: %s", e.Code, e.Message)
+}
+
+var (
+	errInternalError      = &httpError{500, "internal error"}
+	errBadRequest         = &httpError{400, "bad request"}
+	errUnauthorized       = &httpError{401, "unauthorized"}
+	errNotFound           = &httpError{404, "not found"}
+	errPreconditionFailed = &httpError{412, "precondition failed"}
+)
+
+var _ = errUnauthorized
+
+// === loms/internal/http/handler/helper.go ===
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"reflect"
+	"route256/cart/pkg/http/middleware"
+	"route256/loms/internal/model"
+)
+
+type helper struct {
+	w  http.ResponseWriter
+	r  *http.Request
+	lg *slog.Logger
+}
+
+func newHelper(w http.ResponseWriter, r *http.Request, op string) helper {
+	return helper{
+		w: w,
+		r: r,
+		lg: middleware.GetLoggerFromContextOrDefault(r.Context()).
+			With("op", "handler#"+op),
+	}
+}
+
+func (x helper) ctx() context.Context {
+	return x.r.Context()
+}
+
+func (x helper) log() *slog.Logger {
+	return x.lg
+}
+
+func (x helper) checkPOSTMethod() bool {
+	if x.r.Method != http.MethodPost {
+		x.log().Error("logical error: using for a non-POST request", "method", x.r.Method, "url", x.r.URL)
+		x.writeError(errInternalError)
+		return false
+	}
+	return true
+}
+
+func (x helper) getAuthToken() string {
+	return x.r.Header.Get("X-Authtoken")
+}
+
+func (x helper) ReadBody() ([]byte, bool) {
+	body, err := io.ReadAll(x.r.Body)
+	if err != nil {
+		x.log().Error("can't read request body", "error", err)
+		x.writeError(errInternalError)
+		return nil, false
+	}
+	return body, true
+}
+
+func (x helper) decodeBody(req any) bool {
+	body, ok := x.ReadBody()
+	if !ok {
+		return false
+	}
+	if err := json.Unmarshal(body, req); err != nil {
+		x.log().Debug("can't unmarshal request body", "error", err)
+		x.writeError(errBadRequest)
+		return false
+	}
+	return true
+}
+
+type Validator interface {
+	Validate() error
+}
+
+func (x helper) validateRequest(req any) bool {
+	if req2, ok := req.(Validator); !ok {
+		x.log().Error("request not implement Validator", "reqType", reflect.TypeOf(req))
+		x.writeError(errInternalError)
+		return false
+	} else if err := req2.Validate(); err != nil {
+		x.log().Debug("can't validate request", "error", err)
+		x.writeError(errBadRequest)
+		return false
+	}
+	return true
+}
+
+func (x helper) decodeBodyAndValidateRequest(req any) bool {
+	return x.decodeBody(req) && x.validateRequest(req)
+}
+
+func (x helper) writeResponse(status int, resp any) {
+	jsonData, err := json.Marshal(resp)
+	if err != nil {
+		x.log().Error("can't marshal response", "error", err)
+		x.writeError(errInternalError)
+		return
+	}
+
+	x.w.Header().Add("content-type", "application/json")
+	x.w.WriteHeader(status)
+
+	if _, err := x.w.Write(jsonData); err != nil {
+		x.log().Error("can't write response", "error", err)
+		return
+	}
+}
+
+func (x helper) writeError(err error) {
+	var httpErr *httpError
+	switch {
+	case errors.As(err, &httpErr):
+	case errors.Is(err, model.ErrNotFound):
+		httpErr = errNotFound
+	case errors.Is(err, model.ErrPreconditionFailed):
+		httpErr = errPreconditionFailed
+	case errors.Is(err, model.ErrInternalError):
+		httpErr = errInternalError
+	default:
+		x.log().Warn("unhandled error", "error", err)
+		httpErr = errInternalError
+	}
+	http.Error(x.w, httpErr.Message, httpErr.Code)
+}
+
+// === loms/internal/http/handler/loms.go ===
+package handler
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"route256/loms/internal/model"
+	"strconv"
+)
+
+type orderItem struct {
+	SKU   model.SKU `json:"sku"`
+	Count int       `json:"count"`
+}
+
+type createOrderRequest struct {
+	User  model.UserID `json:"user"`
+	Items []orderItem  `json:"items"`
+}
+
+func (req createOrderRequest) Validate() error {
+	var errs []error
+	if req.User <= 0 {
+		errs = append(errs, errors.New("user must be > 0"))
+	}
+	if len(req.Items) == 0 {
+		errs = append(errs, errors.New("items cannot be empty"))
+	}
+	for i, item := range req.Items {
+		if item.SKU <= 0 {
+			errs = append(errs, errors.New("item["+strconv.Itoa(i)+"]: sku must be > 0"))
+		}
+		if item.Count <= 0 {
+			errs = append(errs, errors.New("item["+strconv.Itoa(i)+"]: count must be > 0"))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+type createOreserResponce struct {
+	OrderID model.OrderID `json:"orderID"`
+}
+
+func CreateOrder(crateFunc func(ctx context.Context, req model.CreateOrderRequest) (orderID model.OrderID, err error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		x := newHelper(w, r, "CreateOrder")
+
+		var req createOrderRequest
+		if !x.decodeBodyAndValidateRequest(&req) {
+			return
+		}
+
+		mreq := model.CreateOrderRequest{
+			UserID: req.User,
+			Items:  make([]model.OrderItem, 0, len(req.Items)),
+		}
+		for _, item := range req.Items {
+			mreq.Items = append(mreq.Items, model.OrderItem{
+				SKU:   item.SKU,
+				Count: item.Count,
+			})
+		}
+
+		orderID, err := crateFunc(x.ctx(), mreq)
+		if err != nil {
+			x.writeError(err)
+			return
+		}
+
+		x.writeResponse(200, createOreserResponce{orderID}) // or 201 ?
+	}
+}
+
+type getOrderRequest struct {
+	OrderID model.OrderID `json:"orderID"`
+}
+
+type getOrderInfoRequest = getOrderRequest
+
+func (req getOrderInfoRequest) Validate() error {
+	if req.OrderID <= 0 {
+		return errors.New("orderID must be > 0")
+	}
+	return nil
+}
+
+type getOrderInfoResponse struct {
+	Status string       `json:"status"`
+	User   model.UserID `json:"user"`
+	Items  []orderItem  `json:"items"`
+}
+
+func GetOrderInfo(getFunc func(ctx context.Context, orderID model.OrderID) (resp model.Order, err error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		x := newHelper(w, r, "GetOrederInfo")
+
+		var req getOrderInfoRequest
+		if !x.decodeBodyAndValidateRequest(&req) {
+			return
+		}
+
+		mresp, err := getFunc(x.ctx(), req.OrderID)
+		if err != nil {
+			x.writeError(err)
+			return
+		}
+
+		resp := getOrderInfoResponse{
+			Status: mresp.Status.String(),
+			User:   mresp.UserID,
+			Items:  make([]orderItem, 0, len(mresp.Items)),
+		}
+		for _, item := range mresp.Items {
+			resp.Items = append(resp.Items, orderItem{
+				SKU:   item.SKU,
+				Count: item.Count,
+			})
+		}
+
+		x.writeResponse(200, resp)
+	}
+}
+
+type payOrderRequest = getOrderRequest
+
+func PayOrder(payFunc func(ctx context.Context, orderID model.OrderID) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		x := newHelper(w, r, "PayOrder")
+
+		var req payOrderRequest
+		if !x.decodeBodyAndValidateRequest(&req) {
+			return
+		}
+
+		if err := payFunc(x.ctx(), req.OrderID); err != nil {
+			x.writeError(err)
+			return
+		}
+
+		x.writeResponse(200, struct{}{})
+	}
+}
+
+type cancelOrderRequest = getOrderRequest
+
+func CancelOrder(cancelFunc func(ctx context.Context, orderID model.OrderID) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		x := newHelper(w, r, "CancelOrder")
+
+		var req cancelOrderRequest
+		if !x.decodeBodyAndValidateRequest(&req) {
+			return
+		}
+
+		if err := cancelFunc(x.ctx(), req.OrderID); err != nil {
+			x.writeError(err)
+			return
+		}
+
+		x.writeResponse(200, struct{}{})
+	}
+}
+
+type getStockInfoRequest struct {
+	SKU model.SKU `json:"sku"`
+}
+
+func (req getStockInfoRequest) Validate() error {
+	if req.SKU <= 0 {
+		return errors.New("sku must be > 0")
+	}
+	return nil
+}
+
+type getStockInfoResponse struct {
+	Count uint64 `json:"count"`
+}
+
+func GetStockInfo(getFunc func(ctx context.Context, sku model.SKU) (count uint64, err error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		x := newHelper(w, r, "GetStockInfo")
+
+		var req getStockInfoRequest
+		if !x.decodeBodyAndValidateRequest(&req) {
+			return
+		}
+
+		count, err := getFunc(x.ctx(), req.SKU)
+		if err != nil {
+			x.writeError(err)
+			return
+		}
+
+		x.writeResponse(200, getStockInfoResponse{count})
+	}
+}
+
+// === loms/internal/memstor/order.go ===
+package memstor
+
+import (
+	"context"
+	"route256/loms/internal/model"
+	"route256/loms/internal/service"
+	"slices"
+	"sync"
+)
+
+type Order struct {
+	mu      sync.RWMutex
+	idCount model.OrderID
+	items   map[model.OrderID]model.Order
+}
+
+func NewOrder() *Order {
+	return &Order{
+		items: map[model.OrderID]model.Order{},
+	}
+}
+
+func (o *Order) newOrderID() model.OrderID {
+	o.idCount++
+	return o.idCount
+}
+
+// Create implements service.OrderStorage.
+func (o *Order) Create(_ context.Context, req model.CreateOrderRequest) (model.OrderID, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	orderID := o.newOrderID()
+	status := model.OrderStatusNew
+
+	o.items[orderID] = model.Order{
+		Status: status,
+		UserID: req.UserID,
+		Items:  slices.Clone(req.Items),
+	}
+
+	return orderID, nil
+}
+
+// GetByID implements service.OrderStorage.
+func (o *Order) GetByID(_ context.Context, orderID model.OrderID) (model.Order, error) {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+
+	order, exists := o.items[orderID]
+	if !exists {
+		return model.Order{}, model.ErrNotFound
+	}
+
+	return order, nil
+}
+
+// SetStatus implements service.OrderStorage.
+func (o *Order) SetStatus(_ context.Context, req model.SetOrderStatusRequest) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	order, exists := o.items[req.OrderID]
+	if !exists {
+		return model.ErrNotFound
+	}
+
+	order.Status = req.Status
+	o.items[req.OrderID] = order
+	return nil
+}
+
+var _ service.OrderStorage = &Order{}
+
+// === loms/internal/memstor/stock.go ===
+package memstor
+
+import (
+	"context"
+	"fmt"
+	"math/rand/v2"
+	"route256/loms/internal/model"
+	"route256/loms/internal/service"
+	"sync"
+)
+
+type stockItem struct {
+	count    int64
+	reserved int64
+}
+
+func (si stockItem) available() int64 {
+	return si.count - si.reserved
+}
+
+type Stock struct {
+	mu    sync.RWMutex
+	items map[model.SKU]stockItem
+}
+
+func NewStock() *Stock {
+	return &Stock{
+		items: map[model.SKU]stockItem{},
+	}
+}
+
+func NewRandomStock(producs []model.SKU) *Stock {
+	const maxProductCount = 10
+
+	items := make([]StockItem, 0, len(producs))
+	for _, sku := range producs {
+		items = append(items, StockItem{
+			SKU:   sku,
+			Count: rand.Int64N(maxProductCount),
+		})
+	}
+
+	stock := NewStock()
+	stock.Init(items)
+	return stock
+}
+
+type StockItem struct {
+	SKU   model.SKU
+	Count int64
+}
+
+func (s *Stock) Init(items []StockItem) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.items = make(map[model.SKU]stockItem)
+	for _, item := range items {
+		s.items[item.SKU] = stockItem{count: item.Count}
+	}
+}
+
+// GetBySKU implements service.StockStorage.
+func (s *Stock) GetBySKU(_ context.Context, sku model.SKU) (_ model.Stock, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	item, exists := s.items[sku]
+	if !exists {
+		return model.Stock{}, model.ErrNotFound
+	}
+	return model.Stock{
+		SKU:      sku,
+		Count:    int64(item.count),
+		Reserved: int64(item.reserved),
+	}, nil
+}
+
+// Reserve implements service.StockStorage.
+func (s *Stock) Reserve(_ context.Context, orderItems []model.OrderItem) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	stockItems := make([]stockItem, 0, len(orderItems))
+	for _, orderItem := range orderItems {
+		stockItems = append(stockItems, s.items[orderItem.SKU])
+	}
+
+	for i := range stockItems {
+		n := int64(orderItems[i].Count)
+		if stockItems[i].available() < n {
+			return fmt.Errorf("insufficient available SKU=%v", orderItems[i].SKU)
+		}
+		stockItems[i].reserved += n
+	}
+
+	for i := range stockItems {
+		s.items[orderItems[i].SKU] = stockItems[i]
+	}
+
+	return nil
+}
+
+// ReserveCancel implements service.StockStorage.
+func (s *Stock) ReserveCancel(_ context.Context, orderItems []model.OrderItem) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	stockItems := make([]stockItem, 0, len(orderItems))
+	for _, orderItem := range orderItems {
+		stockItems = append(stockItems, s.items[orderItem.SKU])
+	}
+
+	for i := range stockItems {
+		n := int64(orderItems[i].Count)
+		if stockItems[i].reserved < n {
+			return fmt.Errorf("insufficient reserved SKU=%v", orderItems[i].SKU)
+		}
+		stockItems[i].reserved -= n
+	}
+
+	for i := range stockItems {
+		s.items[orderItems[i].SKU] = stockItems[i]
+	}
+
+	return nil
+}
+
+// ReserveRemove implements service.StockStorage.
+func (s *Stock) ReserveRemove(_ context.Context, orderItems []model.OrderItem) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	stockItems := make([]stockItem, 0, len(orderItems))
+	for _, orderItem := range orderItems {
+		stockItems = append(stockItems, s.items[orderItem.SKU])
+	}
+
+	for i := range stockItems {
+		n := int64(orderItems[i].Count)
+		if stockItems[i].reserved < n {
+			return fmt.Errorf("insufficient count SKU=%v", orderItems[i].SKU)
+		}
+		if stockItems[i].reserved < n {
+			return fmt.Errorf("insufficient reserved SKU=%v", orderItems[i].SKU)
+		}
+		stockItems[i].count -= n
+		stockItems[i].reserved -= n
+	}
+
+	for i := range stockItems {
+		s.items[orderItems[i].SKU] = stockItems[i]
+	}
+
+	return nil
+}
+
+var _ service.StockStorage = &Stock{}
+
+// === loms/internal/model/dto.go ===
+package model
+
+type CreateOrderRequest struct {
+	UserID UserID
+	Items  []OrderItem
+}
+
+type SetOrderStatusRequest struct {
+	OrderID OrderID
+	Status  OrderStatus
+}
+
+// === loms/internal/model/error.go ===
+package model
+
+import "errors"
+
+var (
+	ErrInternalError      = errors.New("internal error")
+	ErrNotFound           = errors.New("not found")
+	ErrPreconditionFailed = errors.New("precondition failed")
+)
+
+// === loms/internal/model/model.go ===
+package model
+
+type (
+	OrderID int64
+	UserID  int64
+	SKU     int64
+)
+
+type Order struct {
+	OrderID
+	UserID
+	Status OrderStatus
+	Items  []OrderItem
+}
+
+type OrderItem struct {
+	SKU
+	Count int
+}
+
+type Stock struct {
+	SKU
+	Count    int64
+	Reserved int64
+}
+
+// === loms/internal/model/order_status.go ===
+package model
+
+import (
+	"encoding/json"
+	"fmt"
+	"strconv"
+)
+
+type OrderStatus int
+
+const (
+	_ OrderStatus = iota
+	OrderStatusNew
+	OrderStatusAwaitingPayment
+	OrderStatusFailed
+	OrderStatusPayed
+	OrderStatusCancelled
+)
+
+func ParseOrderStatus(s string) (OrderStatus, error) {
+	switch s {
+	case "new":
+		return OrderStatusNew, nil
+	case "awaiting payment":
+		return OrderStatusAwaitingPayment, nil
+	case "failed":
+		return OrderStatusFailed, nil
+	case "payed":
+		return OrderStatusPayed, nil
+	case "cancelled":
+		return OrderStatusCancelled, nil
+	}
+	return 0, fmt.Errorf("ParseOrderStatus: unknown value %q", s)
+}
+
+func (os OrderStatus) String() string {
+	switch os {
+	case OrderStatusNew:
+		return "new"
+	case OrderStatusAwaitingPayment:
+		return "awaiting payment"
+	case OrderStatusFailed:
+		return "failed"
+	case OrderStatusPayed:
+		return "payed"
+	case OrderStatusCancelled:
+		return "cancelled"
+	default:
+		return fmt.Sprintf("OrderStatus(%d)", os)
+	}
+}
+
+// MarshalJSON implements json.Marshaler.
+func (os OrderStatus) MarshalJSON() ([]byte, error) {
+	return []byte(os.String()), nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (os *OrderStatus) UnmarshalJSON(b []byte) error {
+	if string(b) == "null" {
+		return nil
+	}
+	s, err := strconv.Unquote(string(b))
+	if err != nil {
+		return fmt.Errorf("OrderSttus.UnmarshalJSON: %w", err)
+	}
+	v, err := ParseOrderStatus(s)
+	if err != nil {
+		return err
+	}
+	*os = v
+	return nil
+}
+
+var _ json.Marshaler = OrderStatus(0)
+var _ json.Unmarshaler = new(OrderStatus)
+
+// === loms/internal/repo/order/adapter.go ===
+package order
+
+import (
+	"context"
+	"route256/loms/internal/model"
+	"route256/loms/internal/service"
+)
+
+type Adapter struct {
+	*Queries
+}
+
+// Create implements storage.
+func (a Adapter) Create(ctx context.Context, req model.CreateOrderRequest) (model.OrderID, error) {
+	orderID, err := a.Queries.Create(ctx, int64(req.UserID))
+	if err != nil {
+		return 0, err
+	}
+
+	n := len(req.Items)
+	orders := make([]int64, 0, n)
+	skus := make([]int64, 0, n)
+	counts := make([]int32, 0, n)
+	for _, item := range req.Items {
+		orders = append(orders, orderID)
+		skus = append(skus, int64(item.SKU))
+		counts = append(counts, int32(item.Count))
+	}
+
+	if err := a.Queries.AddItems(ctx, AddItemsParams{
+		Column1: orders,
+		Column2: skus,
+		Column3: counts,
+	}); err != nil {
+		return 0, err
+	}
+
+	return model.OrderID(orderID), nil
+}
+
+// GetByID implements storage.
+func (a Adapter) GetByID(ctx context.Context, orderID model.OrderID) (model.Order, error) {
+	qresp, err := a.Queries.GetByID(ctx, int64(orderID))
+	if err != nil {
+		return model.Order{}, err
+	}
+	if len(qresp) == 0 {
+		return model.Order{}, model.ErrNotFound
+	}
+	status, err := model.ParseOrderStatus(string(qresp[0].Status))
+	if err != nil {
+		return model.Order{}, err
+	}
+
+	resp := model.Order{
+		UserID: model.UserID(qresp[0].UserID),
+		Status: status,
+		Items:  make([]model.OrderItem, 0, len(qresp)),
+	}
+
+	for _, item := range qresp {
+		resp.Items = append(resp.Items, model.OrderItem{
+			SKU:   model.SKU(item.Sku),
+			Count: int(item.Count),
+		})
+	}
+
+	return resp, nil
+}
+
+// SetStatus implements storage.
+func (a Adapter) SetStatus(ctx context.Context, req model.SetOrderStatusRequest) error {
+	return a.Queries.SetStatus(ctx, SetStatusParams{
+		OrderID: int64(req.OrderID),
+		Status:  OrderStatus(req.Status.String()),
+	})
+}
+
+var _ service.OrderStorage = Adapter{}
+
+type StockAdapter struct {
+	*Queries
+}
+
+// === loms/internal/repo/order/db.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package order
+
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+type DBTX interface {
+	Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...interface{}) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...interface{}) pgx.Row
+}
+
+func New(db DBTX) *Queries {
+	return &Queries{db: db}
+}
+
+type Queries struct {
+	db DBTX
+}
+
+func (q *Queries) WithTx(tx pgx.Tx) *Queries {
+	return &Queries{
+		db: tx,
+	}
+}
+
+// === loms/internal/repo/order/models.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package order
+
+import (
+	"database/sql/driver"
+	"fmt"
+)
+
+type OrderStatus string
+
+const (
+	OrderStatusNew             OrderStatus = "new"
+	OrderStatusAwaitingpayment OrderStatus = "awaiting payment"
+	OrderStatusFailed          OrderStatus = "failed"
+	OrderStatusPayed           OrderStatus = "payed"
+	OrderStatusCancelled       OrderStatus = "cancelled"
+)
+
+func (e *OrderStatus) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = OrderStatus(s)
+	case string:
+		*e = OrderStatus(s)
+	default:
+		return fmt.Errorf("unsupported scan type for OrderStatus: %T", src)
+	}
+	return nil
+}
+
+type NullOrderStatus struct {
+	OrderStatus OrderStatus `json:"order_status"`
+	Valid       bool        `json:"valid"` // Valid is true if OrderStatus is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullOrderStatus) Scan(value interface{}) error {
+	if value == nil {
+		ns.OrderStatus, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.OrderStatus.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullOrderStatus) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.OrderStatus), nil
+}
+
+// === loms/internal/repo/order/querier.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package order
+
+import (
+	"context"
+)
+
+type Querier interface {
+	AddItems(ctx context.Context, arg AddItemsParams) error
+	Create(ctx context.Context, userID int64) (int64, error)
+	GetByID(ctx context.Context, orderID int64) ([]GetByIDRow, error)
+	SetStatus(ctx context.Context, arg SetStatusParams) error
+}
+
+var _ Querier = (*Queries)(nil)
+
+// === loms/internal/repo/order/queries.sql.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+// source: queries.sql
+
+package order
+
+import (
+	"context"
+)
+
+const addItems = `-- name: AddItems :exec
+INSERT INTO order_items (order_id, sku, count)
+SELECT UNNEST($1::bigint[]) AS order_id, UNNEST($2::bigint[]) AS sku, UNNEST($3::int[]) AS count
+`
+
+type AddItemsParams struct {
+	Column1 []int64 `json:"column_1"`
+	Column2 []int64 `json:"column_2"`
+	Column3 []int32 `json:"column_3"`
+}
+
+func (q *Queries) AddItems(ctx context.Context, arg AddItemsParams) error {
+	_, err := q.db.Exec(ctx, addItems, arg.Column1, arg.Column2, arg.Column3)
+	return err
+}
+
+const create = `-- name: Create :one
+INSERT INTO "order" (user_id, status) VALUES ($1, 'new')
+RETURNING order_id
+`
+
+func (q *Queries) Create(ctx context.Context, userID int64) (int64, error) {
+	row := q.db.QueryRow(ctx, create, userID)
+	var order_id int64
+	err := row.Scan(&order_id)
+	return order_id, err
+}
+
+const getByID = `-- name: GetByID :many
+SELECT o.order_id, o.user_id, o.status, oi.sku, oi.count
+FROM "order" AS o JOIN order_items AS oi USING(order_id)
+WHERE o.order_id = $1
+`
+
+type GetByIDRow struct {
+	OrderID int64       `json:"order_id"`
+	UserID  int64       `json:"user_id"`
+	Status  OrderStatus `json:"status"`
+	Sku     int64       `json:"sku"`
+	Count   int32       `json:"count"`
+}
+
+func (q *Queries) GetByID(ctx context.Context, orderID int64) ([]GetByIDRow, error) {
+	rows, err := q.db.Query(ctx, getByID, orderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetByIDRow
+	for rows.Next() {
+		var i GetByIDRow
+		if err := rows.Scan(
+			&i.OrderID,
+			&i.UserID,
+			&i.Status,
+			&i.Sku,
+			&i.Count,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const setStatus = `-- name: SetStatus :exec
+UPDATE "order" set status = $2
+WHERE order_id = $1
+`
+
+type SetStatusParams struct {
+	OrderID int64       `json:"order_id"`
+	Status  OrderStatus `json:"status"`
+}
+
+func (q *Queries) SetStatus(ctx context.Context, arg SetStatusParams) error {
+	_, err := q.db.Exec(ctx, setStatus, arg.OrderID, arg.Status)
+	return err
+}
+
+// === loms/internal/repo/stock/adapter.go ===
+package stock
+
+import (
+	"context"
+	"route256/loms/internal/model"
+	"route256/loms/internal/service"
+)
+
+type Adapter struct {
+	*Queries
+}
+
+// GetBySKU implements storage.
+func (a Adapter) GetBySKU(ctx context.Context, sku model.SKU) (_ model.Stock, err error) {
+	qresp, err := a.Queries.GetBySKU(ctx, int64(sku))
+	if err != nil {
+		return model.Stock{}, err
+	}
+	return model.Stock{
+		SKU:      sku,
+		Count:    qresp.Count,
+		Reserved: qresp.Reserved,
+	}, nil
+}
+
+// Reserve implements storage.
+func (a Adapter) Reserve(ctx context.Context, items []model.OrderItem) (err error) {
+	qitems := make([]ReserveParams, 0, len(items))
+	for _, item := range items {
+		qitems = append(qitems, ReserveParams{
+			Sku:      int64(item.SKU),
+			Reserved: int64(item.Count)},
+		)
+	}
+	b := a.Queries.Reserve(ctx, qitems)
+	b.QueryRow(nil) // TODO: check error for each SKU
+	return b.Close()
+}
+
+// ReserveCancel implements storage.
+func (a Adapter) ReserveCancel(ctx context.Context, items []model.OrderItem) error {
+	qitems := make([]ReserveCancelParams, 0, len(items))
+	for _, item := range items {
+		qitems = append(qitems, ReserveCancelParams{
+			Sku:      int64(item.SKU),
+			Reserved: int64(item.Count)},
+		)
+	}
+	b := a.Queries.ReserveCancel(ctx, qitems)
+	b.QueryRow(nil) // TODO: check error for each SKU
+	return b.Close()
+}
+
+// ReserveRemove implements storage.
+func (a Adapter) ReserveRemove(ctx context.Context, items []model.OrderItem) error {
+	qitems := make([]ReserveRemoveParams, 0, len(items))
+	for _, item := range items {
+		qitems = append(qitems, ReserveRemoveParams{
+			Sku:   int64(item.SKU),
+			Count: int64(item.Count)},
+		)
+	}
+	b := a.Queries.ReserveRemove(ctx, qitems)
+	b.QueryRow(nil) // TODO: check error for each SKU
+	return b.Close()
+}
+
+var _ service.StockStorage = Adapter{}
+
+// === loms/internal/repo/stock/batch.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+// source: batch.go
+
+package stock
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+)
+
+var (
+	ErrBatchAlreadyClosed = errors.New("batch already closed")
+)
+
+const reserve = `-- name: Reserve :batchone
+UPDATE stock SET reserved = $2
+WHERE sku = $1 AND count-reserved >= $2
+RETURNING sku
+`
+
+type ReserveBatchResults struct {
+	br     pgx.BatchResults
+	tot    int
+	closed bool
+}
+
+type ReserveParams struct {
+	Sku      int64 `json:"sku"`
+	Reserved int64 `json:"reserved"`
+}
+
+func (q *Queries) Reserve(ctx context.Context, arg []ReserveParams) *ReserveBatchResults {
+	batch := &pgx.Batch{}
+	for _, a := range arg {
+		vals := []interface{}{
+			a.Sku,
+			a.Reserved,
+		}
+		batch.Queue(reserve, vals...)
+	}
+	br := q.db.SendBatch(ctx, batch)
+	return &ReserveBatchResults{br, len(arg), false}
+}
+
+func (b *ReserveBatchResults) QueryRow(f func(int, int64, error)) {
+	defer b.br.Close()
+	for t := 0; t < b.tot; t++ {
+		var sku int64
+		if b.closed {
+			if f != nil {
+				f(t, sku, ErrBatchAlreadyClosed)
+			}
+			continue
+		}
+		row := b.br.QueryRow()
+		err := row.Scan(&sku)
+		if f != nil {
+			f(t, sku, err)
+		}
+	}
+}
+
+func (b *ReserveBatchResults) Close() error {
+	b.closed = true
+	return b.br.Close()
+}
+
+const reserveCancel = `-- name: ReserveCancel :batchone
+UPDATE stock SET reserved = reserved-$2
+WHERE sku = $1 AND reserved >= $2
+RETURNING sku
+`
+
+type ReserveCancelBatchResults struct {
+	br     pgx.BatchResults
+	tot    int
+	closed bool
+}
+
+type ReserveCancelParams struct {
+	Sku      int64 `json:"sku"`
+	Reserved int64 `json:"reserved"`
+}
+
+func (q *Queries) ReserveCancel(ctx context.Context, arg []ReserveCancelParams) *ReserveCancelBatchResults {
+	batch := &pgx.Batch{}
+	for _, a := range arg {
+		vals := []interface{}{
+			a.Sku,
+			a.Reserved,
+		}
+		batch.Queue(reserveCancel, vals...)
+	}
+	br := q.db.SendBatch(ctx, batch)
+	return &ReserveCancelBatchResults{br, len(arg), false}
+}
+
+func (b *ReserveCancelBatchResults) QueryRow(f func(int, int64, error)) {
+	defer b.br.Close()
+	for t := 0; t < b.tot; t++ {
+		var sku int64
+		if b.closed {
+			if f != nil {
+				f(t, sku, ErrBatchAlreadyClosed)
+			}
+			continue
+		}
+		row := b.br.QueryRow()
+		err := row.Scan(&sku)
+		if f != nil {
+			f(t, sku, err)
+		}
+	}
+}
+
+func (b *ReserveCancelBatchResults) Close() error {
+	b.closed = true
+	return b.br.Close()
+}
+
+const reserveRemove = `-- name: ReserveRemove :batchone
+UPDATE stock SET (count, reserved) = (count-$2, reserved-$2)
+WHERE sku = $1 AND count >= $2 AND reserved >= $2
+RETURNING sku
+`
+
+type ReserveRemoveBatchResults struct {
+	br     pgx.BatchResults
+	tot    int
+	closed bool
+}
+
+type ReserveRemoveParams struct {
+	Sku   int64 `json:"sku"`
+	Count int64 `json:"count"`
+}
+
+func (q *Queries) ReserveRemove(ctx context.Context, arg []ReserveRemoveParams) *ReserveRemoveBatchResults {
+	batch := &pgx.Batch{}
+	for _, a := range arg {
+		vals := []interface{}{
+			a.Sku,
+			a.Count,
+		}
+		batch.Queue(reserveRemove, vals...)
+	}
+	br := q.db.SendBatch(ctx, batch)
+	return &ReserveRemoveBatchResults{br, len(arg), false}
+}
+
+func (b *ReserveRemoveBatchResults) QueryRow(f func(int, int64, error)) {
+	defer b.br.Close()
+	for t := 0; t < b.tot; t++ {
+		var sku int64
+		if b.closed {
+			if f != nil {
+				f(t, sku, ErrBatchAlreadyClosed)
+			}
+			continue
+		}
+		row := b.br.QueryRow()
+		err := row.Scan(&sku)
+		if f != nil {
+			f(t, sku, err)
+		}
+	}
+}
+
+func (b *ReserveRemoveBatchResults) Close() error {
+	b.closed = true
+	return b.br.Close()
+}
+
+// === loms/internal/repo/stock/db.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package stock
+
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+type DBTX interface {
+	Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...interface{}) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...interface{}) pgx.Row
+	SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
+}
+
+func New(db DBTX) *Queries {
+	return &Queries{db: db}
+}
+
+type Queries struct {
+	db DBTX
+}
+
+func (q *Queries) WithTx(tx pgx.Tx) *Queries {
+	return &Queries{
+		db: tx,
+	}
+}
+
+// === loms/internal/repo/stock/models.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package stock
+
+type Stock struct {
+	Sku      int64 `json:"sku"`
+	Count    int64 `json:"count"`
+	Reserved int64 `json:"reserved"`
+}
+
+// === loms/internal/repo/stock/querier.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+
+package stock
+
+import (
+	"context"
+)
+
+type Querier interface {
+	GetBySKU(ctx context.Context, sku int64) (Stock, error)
+	Reserve(ctx context.Context, arg []ReserveParams) *ReserveBatchResults
+	ReserveCancel(ctx context.Context, arg []ReserveCancelParams) *ReserveCancelBatchResults
+	ReserveRemove(ctx context.Context, arg []ReserveRemoveParams) *ReserveRemoveBatchResults
+}
+
+var _ Querier = (*Queries)(nil)
+
+// === loms/internal/repo/stock/queries.sql.go ===
+// Code generated by sqlc. DO NOT EDIT.
+// versions:
+//   sqlc v1.28.0
+// source: queries.sql
+
+package stock
+
+import (
+	"context"
+)
+
+const getBySKU = `-- name: GetBySKU :one
+SELECT sku, count, reserved FROM stock
+WHERE sku = $1
+`
+
+func (q *Queries) GetBySKU(ctx context.Context, sku int64) (Stock, error) {
+	row := q.db.QueryRow(ctx, getBySKU, sku)
+	var i Stock
+	err := row.Scan(&i.Sku, &i.Count, &i.Reserved)
+	return i, err
+}
+
+// === loms/internal/service/logger.go ===
+package service
+
+import (
+	"context"
+	"log/slog"
+	"route256/cart/pkg/http/middleware"
+)
+
+func getLogger(ctx context.Context, op string) *slog.Logger {
+	return middleware.GetLoggerFromContextOrDefault(ctx).
+		With("op", "service#"+op)
+}
+
+// === loms/internal/service/loms.go ===
+package service
+
+import (
+	"context"
+	"route256/loms/internal/model"
+)
+
+type OrderStorage interface {
+	Create(ctx context.Context, req model.CreateOrderRequest) (model.OrderID, error)
+	SetStatus(ctx context.Context, req model.SetOrderStatusRequest) error
+	GetByID(ctx context.Context, orderID model.OrderID) (model.Order, error)
+}
+
+type StockStorage interface {
+	Reserve(ctx context.Context, items []model.OrderItem) error
+	ReserveRemove(ctx context.Context, items []model.OrderItem) error
+	ReserveCancel(ctx context.Context, items []model.OrderItem) error
+	GetBySKU(ctx context.Context, sku model.SKU) (stock model.Stock, err error)
+}
+
+type LOMS struct {
+	order OrderStorage
+	stock StockStorage
+}
+
+func NewLOMS(order OrderStorage, stock StockStorage) *LOMS {
+	return &LOMS{
+		order: order,
+		stock: stock,
+	}
+}
+
+func (p *LOMS) CreateOrder(ctx context.Context, req model.CreateOrderRequest) (orderID model.OrderID, err error) {
+	log := getLogger(ctx, "LOMS.CreateOrder")
+
+	orderID, err = p.order.Create(ctx, req)
+	if err != nil {
+		return orderID, err
+	}
+
+	var status model.OrderStatus
+	if err := p.stock.Reserve(ctx, req.Items); err != nil {
+		status = model.OrderStatusFailed
+	} else {
+		status = model.OrderStatusAwaitingPayment
+	}
+
+	if err := p.order.SetStatus(ctx, model.SetOrderStatusRequest{
+		OrderID: orderID,
+		Status:  status,
+	}); err != nil {
+		log.Error("can't set order status", "error", err)
+		return 0, model.ErrInternalError
+	}
+
+	if status == model.OrderStatusAwaitingPayment {
+		return orderID, nil
+	} else {
+		return 0, model.ErrPreconditionFailed
+	}
+}
+
+func (p *LOMS) GetOrderInfo(ctx context.Context, orderID model.OrderID) (resp model.Order, err error) {
+	return p.order.GetByID(ctx, orderID)
+}
+
+func (p *LOMS) PayOrder(ctx context.Context, orderID model.OrderID) error {
+	log := getLogger(ctx, "LOMS.PayOrder")
+
+	orderInfo, err := p.order.GetByID(ctx, orderID)
+	if err != nil {
+		return err
+	}
+
+	if orderInfo.Status != model.OrderStatusAwaitingPayment {
+		log.Debug("order status must be 'awaiting payment'", "orderStatus", orderInfo.Status)
+		return model.ErrPreconditionFailed
+	}
+
+	if err := p.stock.ReserveRemove(ctx, orderInfo.Items); err != nil {
+		log.Error("can't reserve remove", "error", err)
+		return model.ErrPreconditionFailed
+	}
+
+	if err := p.order.SetStatus(ctx, model.SetOrderStatusRequest{
+		OrderID: orderID,
+		Status:  model.OrderStatusPayed,
+	}); err != nil {
+		log.Error("can't set order status", "error", err)
+		return model.ErrInternalError
+	}
+
+	return nil
+}
+
+func (p *LOMS) CancelOrder(ctx context.Context, orderID model.OrderID) error {
+	log := getLogger(ctx, "LOMS.CancelOrder")
+
+	orderInfo, err := p.order.GetByID(ctx, orderID)
+	if err != nil {
+		return err
+	}
+
+	if orderInfo.Status != model.OrderStatusAwaitingPayment {
+		log.Debug("order status must be 'awaiting payment'", "orderStatus", orderInfo.Status)
+		return model.ErrPreconditionFailed
+	}
+
+	if err := p.stock.ReserveCancel(ctx, orderInfo.Items); err != nil {
+		log.Error("can't reserve cancel", "error", err)
+		return model.ErrPreconditionFailed
+	}
+
+	if err := p.order.SetStatus(ctx, model.SetOrderStatusRequest{
+		OrderID: orderID,
+		Status:  model.OrderStatusCancelled,
+	}); err != nil {
+		log.Error("can't set order status", "error", err)
+		return model.ErrInternalError
+	}
+
+	return nil
+}
+
+func (p *LOMS) GetStockInfo(ctx context.Context, sku model.SKU) (count uint64, err error) {
+	stock, err := p.stock.GetBySKU(ctx, sku)
+	if err != nil {
+		return 0, err
+	}
+	return uint64(stock.Count - stock.Reserved), nil
+}
+
+// === notifications/cmd/app/main.go ===
+package main
+
+func main() {
+
+}
+

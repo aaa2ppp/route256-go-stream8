@@ -1,19 +1,40 @@
-version: "3.1"
 services:
   cart:
     image: cart
     build: ./cart/
+    env_file:
+      - ./cart/.env
     ports:
       - "8082:8080"
     depends_on:
       - loms
+      - db
   loms:
     image: loms
     build: ./loms/
+    env_file:
+      - ./loms/.env
     ports:
       - "8083:8080"
+    depends_on:
+      - db
   # notification:
   #   image: notification
   #   build: ./notification
   #   ports:
   #     - "8082:8082"
+  db:
+    image: postgres:${PGVER:-17.2}
+    #user: ${UID}:${GID}
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db/config:/config:ro
+      - ./db/initdb.d:/docker-entrypoint-initdb.d:ro
+      #- ./db/.docker/postgresql/data:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
+volumes:
+    pgdata:

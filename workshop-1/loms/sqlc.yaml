@@ -1,0 +1,23 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    queries: "internal/repo/order/queries.sql"
+    schema: "migrations"
+    gen:
+      go:
+        package: "queries"
+        sql_package: "pgx/v5"
+        out: "internal/repo/order/queries"
+        emit_json_tags: true
+        emit_interface: true
+        omit_unused_structs: true
+  - engine: "postgresql"
+    queries: "internal/repo/stock/queries.sql"
+    schema: "migrations"
+    gen:
+      go:
+        package: "queries"
+        sql_package: "pgx/v5"
+        out: "internal/repo/stock/queries"
+        emit_interface: true
+        omit_unused_structs: true

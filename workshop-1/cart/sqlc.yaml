@@ -1,0 +1,12 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    queries: "internal/repo/cart/queries.sql"
+    schema: "migrations"
+    gen:
+      go:
+        package: "queries"
+        sql_package: "pgx/v5"
+        out: "internal/repo/cart/queries"
+        emit_interface: true
+        omit_unused_structs: true

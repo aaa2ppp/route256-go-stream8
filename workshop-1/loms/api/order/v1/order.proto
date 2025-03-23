@@ -14,7 +14,7 @@ service Order {
 }
 
 message Item {
-    int32 sku = 1;
+    uint32 sku = 1;
     uint32 count = 2;
 }
 
